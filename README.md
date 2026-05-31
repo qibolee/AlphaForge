@@ -54,7 +54,7 @@ sudo /opt/alphaforge/app/start.sh
 ## 首次安装
 
 ```bash
-git clone git@github.com:<owner>/AlphaForge.git
+git clone git@github.com:qibolee/AlphaForge.git
 cd AlphaForge
 sudo ./install.sh
 sudo nano /etc/alphaforge/env
