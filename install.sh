@@ -2,6 +2,10 @@
 set -euo pipefail
 umask 027
 
+# Directory roles:
+#   source workspace -> git pull and install.sh
+#   /opt/alphaforge  -> production app and venv
+#   /etc/alphaforge  -> runtime config and secrets
 APP_NAME="alphaforge"
 APP_ROOT="/opt/alphaforge"
 APP_DIR="${APP_ROOT}/app"
@@ -12,10 +16,10 @@ STATE_DIR="/var/lib/alphaforge"
 SERVICE_FILE="/etc/systemd/system/alphaforge.service"
 
 SOURCE_DIR=""
-DEPLOY_DIR=""
+FILES_DIR=""
 
 step() {
-  printf "\n[deploy] [%s] %s\n" "$1" "$2"
+  printf "\n[install] [%s] %s\n" "$1" "$2"
 }
 
 info() {
@@ -29,25 +33,25 @@ fail() {
 
 require_root() {
   if [[ "${EUID}" -ne 0 ]]; then
-    fail "deploy.sh must run with sudo"
+    fail "install.sh must run with sudo"
   fi
 }
 
 detect_source_dir() {
   SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  DEPLOY_DIR="${SOURCE_DIR}/deploy"
+  FILES_DIR="${SOURCE_DIR}/files"
   info "source directory: ${SOURCE_DIR}"
-  info "deploy templates:  ${DEPLOY_DIR}"
+  info "install files:    ${FILES_DIR}"
   info "production app:   ${APP_DIR}"
 }
 
 validate_source_workspace() {
-  [[ -d "${DEPLOY_DIR}" ]] \
-    || fail "deploy.sh must run from the source workspace, e.g. /home/ubuntu/AlphaForge; deploy/ is missing"
+  [[ -d "${FILES_DIR}" ]] \
+    || fail "install.sh must run from the source workspace, e.g. /home/ubuntu/AlphaForge; files/ is missing"
   [[ -d "${SOURCE_DIR}/src" ]] \
-    || fail "deploy.sh must run from the source workspace, e.g. /home/ubuntu/AlphaForge; src/ is missing"
+    || fail "install.sh must run from the source workspace, e.g. /home/ubuntu/AlphaForge; src/ is missing"
   [[ -f "${SOURCE_DIR}/pyproject.toml" ]] \
-    || fail "deploy.sh must run from the source workspace, e.g. /home/ubuntu/AlphaForge; pyproject.toml is missing"
+    || fail "install.sh must run from the source workspace, e.g. /home/ubuntu/AlphaForge; pyproject.toml is missing"
 }
 
 require_file() {
@@ -109,6 +113,8 @@ ensure_user_and_dirs() {
   info "created production directories"
 }
 
+# Copy runtime files from the source workspace into APP_DIR.
+# files/ stays in the source workspace; its contents are installed into system paths.
 sync_app() {
   local source_real
   local app_real
@@ -128,47 +134,53 @@ sync_app() {
     --exclude __pycache__ \
     --exclude .pytest_cache \
     --exclude .ruff_cache \
-    --exclude deploy \
+    --exclude files \
     --exclude tests \
-    --exclude deploy.sh \
+    --exclude install.sh \
     "${SOURCE_DIR}/" \
     "${APP_DIR}/"
 
   info "synced ${SOURCE_DIR} -> ${APP_DIR}"
 }
 
+# Install the production Python runtime.
+# pip reads APP_DIR/pyproject.toml, installs ib_async/PyYAML, and creates VENV_DIR/bin/alphaforge.
+# The -e install keeps alphaforge pointed at APP_DIR/src after each install.
 install_python_env() {
   python3 -m venv "${VENV_DIR}"
   "${VENV_DIR}/bin/pip" install --upgrade pip
   "${VENV_DIR}/bin/pip" install -e "${APP_DIR}"
 }
 
+# Install runtime config under /etc/alphaforge.
+# env/config.yaml are protected after first copy; docker-compose.yml is updated every install.
 install_configs() {
   copy_once \
-    "${DEPLOY_DIR}/etc/alphaforge/env" \
+    "${FILES_DIR}/etc/alphaforge/env" \
     "${ETC_DIR}/env" \
     "0640" \
     "root" \
     "${APP_NAME}"
 
   copy_once \
-    "${DEPLOY_DIR}/etc/alphaforge/config.yaml" \
+    "${FILES_DIR}/etc/alphaforge/config.yaml" \
     "${ETC_DIR}/config.yaml" \
     "0640" \
     "root" \
     "${APP_NAME}"
 
   copy_always \
-    "${DEPLOY_DIR}/etc/alphaforge/docker-compose.yml" \
+    "${FILES_DIR}/etc/alphaforge/docker-compose.yml" \
     "${ETC_DIR}/docker-compose.yml" \
     "0644" \
     "root" \
     "root"
 }
 
+# Install the systemd unit. Its ExecStart runs VENV_DIR/bin/alphaforge run.
 install_service() {
   copy_always \
-    "${DEPLOY_DIR}/etc/systemd/system/alphaforge.service" \
+    "${FILES_DIR}/etc/systemd/system/alphaforge.service" \
     "${SERVICE_FILE}" \
     "0644" \
     "root" \
@@ -184,13 +196,13 @@ reload_systemd() {
 print_summary() {
   cat <<EOF
 
-Deploy complete.
+Install complete.
 
-Protected files, not overwritten on future deploys:
+Protected files, not overwritten on future installs:
   ${ETC_DIR}/env
   ${ETC_DIR}/config.yaml
 
-Updated on every deploy:
+Updated on every install:
   ${ETC_DIR}/docker-compose.yml
   ${SERVICE_FILE}
   ${APP_DIR}
@@ -223,7 +235,7 @@ main() {
   step "3/7" "Sync application code"
   sync_app
 
-  step "4/7" "Create/update Python virtualenv"
+  step "4/7" "Install Python runtime and app dependencies"
   install_python_env
 
   step "5/7" "Install configuration files"

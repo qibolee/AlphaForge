@@ -11,7 +11,7 @@ DEFAULT_CONFIG_PATH = Path("/etc/alphaforge/config.yaml")
 
 try:
     import yaml
-except ImportError:  # pragma: no cover - dependency is installed by deploy.sh.
+except ImportError:  # pragma: no cover - dependency is installed by install.sh.
     yaml = None
 
 
@@ -222,4 +222,3 @@ def _parse_scalar(value: str) -> Any:
         return int(value)
     except ValueError:
         return value
-

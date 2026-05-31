@@ -101,8 +101,8 @@ class IBKRClient:
 def _load_ib_async() -> Any:
     try:
         import ib_async
-    except ImportError as exc:  # pragma: no cover - installed on AWS by deploy.sh.
-        raise RuntimeError("ib_async is not installed; run deploy.sh") from exc
+    except ImportError as exc:  # pragma: no cover - installed on AWS by install.sh.
+        raise RuntimeError("ib_async is not installed; run install.sh") from exc
     return ib_async
 
 
