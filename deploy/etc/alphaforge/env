@@ -1,0 +1,8 @@
+# 部署后在 /etc/alphaforge/env 填真实值；不要把真实值提交到 GitHub。
+IB_USERNAME=
+IB_PASSWORD=
+IB_MODE=paper
+IB_ACCOUNT=
+LIVE_TRADING_ENABLED=false
+AUTO_RESTART_TIME=23:45
+

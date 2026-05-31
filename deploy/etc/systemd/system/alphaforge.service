@@ -1,0 +1,21 @@
+[Unit]
+Description=AlphaForge Trading Engine
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=alphaforge
+Group=alphaforge
+WorkingDirectory=/opt/alphaforge/app
+EnvironmentFile=/etc/alphaforge/env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/alphaforge/venv/bin/alphaforge run
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/alphaforge/service.log
+StandardError=append:/var/log/alphaforge/service.log
+
+[Install]
+WantedBy=multi-user.target

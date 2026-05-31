@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Real secrets live in /etc/alphaforge/env on AWS.
+*.local
+*.secret
+
+# Runtime artifacts live under /var/log/alphaforge and /var/lib/alphaforge.
+*.jsonl
+*.log
+
