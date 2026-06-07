@@ -1,5 +1,5 @@
 strategy_name: grid_v1
-regular_log_sample_rate: 0.001
+audit_log_sample_rate: 0.01
 
 trading_window:
   timezone: America/New_York

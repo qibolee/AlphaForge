@@ -16,14 +16,14 @@ class EventLogger:
         strategy_name: str,
         mode: str,
         account: str,
-        regular_sample_rate: float,
+        audit_sample_rate: float,
     ) -> None:
         self.audit_path = audit_path
         self.trade_path = trade_path
         self.strategy_name = strategy_name
         self.mode = mode
         self.account = account
-        self.regular_sample_rate = regular_sample_rate
+        self.audit_sample_rate = audit_sample_rate
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         self.trade_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -33,9 +33,9 @@ class EventLogger:
         self._append(self.audit_path, record)
 
     def regular(self, event_type: str, symbol: str, **details: object) -> None:
-        if self.regular_sample_rate <= 0:
+        if self.audit_sample_rate <= 0:
             return
-        if self.regular_sample_rate < 1 and random.random() > self.regular_sample_rate:
+        if self.audit_sample_rate < 1 and random.random() > self.audit_sample_rate:
             return
         self._append(self.audit_path, self._record(event_type, symbol, details))
 

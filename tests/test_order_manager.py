@@ -139,7 +139,7 @@ class OrderManagerTest(unittest.TestCase):
 def _manager(tmp: Path, filled_quantity: float) -> tuple[GridRuntimeConfig, OrderManager]:
     config = GridRuntimeConfig(
         strategy_name="grid_v1",
-        regular_log_sample_rate=1,
+        audit_log_sample_rate=1,
         trading_window=TradingWindow("America/New_York", "04:00", "20:00", True),
         grids=[
             GridEntry(
@@ -200,7 +200,7 @@ def _submit_manager(
 ) -> tuple[GridRuntimeConfig, OrderManager, "_SubmittingClient", GridStateStore]:
     config = GridRuntimeConfig(
         strategy_name="grid_v1",
-        regular_log_sample_rate=1,
+        audit_log_sample_rate=1,
         trading_window=TradingWindow("America/New_York", "04:00", "20:00", True),
         grids=[
             GridEntry(

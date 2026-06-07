@@ -37,7 +37,7 @@ class GridStateStore:
 
         return GridRuntimeConfig(
             strategy_name=str(raw.get("strategy_name", "grid_v1")),
-            regular_log_sample_rate=float(raw.get("regular_log_sample_rate", 0.001)),
+            audit_log_sample_rate=_audit_log_sample_rate(raw),
             trading_window=TradingWindow(
                 timezone=str(window_raw.get("timezone", "America/New_York")),
                 start=str(window_raw.get("start", "04:00")),
@@ -119,7 +119,7 @@ def _active_order(raw: Any) -> ActiveOrder | None:
 def _runtime_config_dict(config: GridRuntimeConfig) -> dict[str, Any]:
     return {
         "strategy_name": config.strategy_name,
-        "regular_log_sample_rate": config.regular_log_sample_rate,
+        "audit_log_sample_rate": config.audit_log_sample_rate,
         "trading_window": asdict(config.trading_window),
         "grids": [_grid_entry_dict(grid) for grid in config.grids],
     }
@@ -164,6 +164,12 @@ def _mapping(raw: dict[str, Any], name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigError(f"grid.yaml {name} section must be a mapping")
     return value
+
+
+def _audit_log_sample_rate(raw: dict[str, Any]) -> float:
+    if "audit_log_sample_rate" in raw:
+        return float(raw["audit_log_sample_rate"])
+    return float(raw.get("regular_log_sample_rate", 0.01))
 
 
 def _optional_int(value: Any) -> int | None:

@@ -32,7 +32,7 @@ class TradingEngine:
             grid_config.strategy_name,
             self.settings.env.mode.value,
             self.settings.env.account,
-            grid_config.regular_log_sample_rate,
+            grid_config.audit_log_sample_rate,
         )
         strategy = GridStrategy(grid_config.trading_window)
         order_manager = OrderManager(

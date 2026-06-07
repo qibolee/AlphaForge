@@ -158,7 +158,7 @@ class TradingWindow:
 @dataclass
 class GridRuntimeConfig:
     strategy_name: str
-    regular_log_sample_rate: float
+    audit_log_sample_rate: float
     trading_window: TradingWindow
     grids: list[GridEntry]
 
