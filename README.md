@@ -29,7 +29,7 @@ systemd 管理。
   创建/维护：由 install.sh 每次安装更新。
 
 /var/log/alphaforge
-  用途：日志目录，保存 service.log 和 audit.jsonl。
+  用途：日志目录，保存 service.log、trade.jsonl 和 audit.jsonl。
   创建/维护：由 install.sh 创建，运行时由 alphaforge 服务写入。
 
 /var/lib/alphaforge
@@ -103,6 +103,7 @@ sudo /opt/alphaforge/app/start.sh
 ```text
 /etc/alphaforge/docker-compose.yml
 /etc/systemd/system/alphaforge.service
+/etc/logrotate.d/alphaforge
 /opt/alphaforge/app
 /opt/alphaforge/venv
 ```
@@ -131,7 +132,37 @@ paper -> 127.0.0.1:4002
 live  -> 127.0.0.1:4001
 ```
 
-## 日志
+## 常驻运行与观测
+
+AlphaForge 在 AWS 上常驻运行时，建议从服务、Docker、日志、策略状态四个角度观察。
+
+服务状态：
+
+```bash
+sudo systemctl status alphaforge
+sudo systemctl is-active alphaforge
+sudo systemctl cat alphaforge
+sudo journalctl -u alphaforge -n 100 --no-pager
+sudo journalctl -u alphaforge -f
+```
+
+`systemctl status` 看到 `active (running)` 表示 Python 交易服务正在运行。`systemctl cat`
+可以确认 systemd 实际执行的命令，目前应为 `/opt/alphaforge/venv/bin/alphaforge run`。
+
+IB Gateway Docker 状态：
+
+```bash
+sudo docker ps -a --filter "name=^/ib-gateway$"
+sudo docker logs --tail 100 ib-gateway
+sudo docker logs -f ib-gateway
+sudo docker compose --env-file /etc/alphaforge/env -f /etc/alphaforge/docker-compose.yml ps
+sudo docker compose --env-file /etc/alphaforge/env -f /etc/alphaforge/docker-compose.yml logs -f
+```
+
+`ib-gateway` 容器需要保持 `Up`。如果 AlphaForge 无法连接 IBKR，优先查看 Docker 日志和
+VNC 登录状态，确认 IB Gateway 已经登录成功并启用 API。
+
+AlphaForge 日志：
 
 ```bash
 sudo journalctl -u alphaforge -f
@@ -140,8 +171,83 @@ sudo tail -f /var/log/alphaforge/service.log
 sudo tail -f /var/log/alphaforge/audit.jsonl
 ```
 
-`service.log` 是服务 stdout/stderr。`trade.jsonl` 只记录交易关键事件。`audit.jsonl`
-记录交易事件和采样后的常规事件。
+`service.log` 是服务 stdout/stderr，主要用于查看异常堆栈和底层库提示。`trade.jsonl`
+只记录交易关键事件，例如连接、reconcile、组合加载、触发下单、订单成交、撤单和风控拒绝。
+`audit.jsonl` 记录交易事件和采样后的常规事件，例如行情查询、未触发、非交易窗口等。
+
+策略状态：
+
+```bash
+sudo cat /etc/alphaforge/grid.yaml
+```
+
+`grid.yaml` 是网格策略参数和状态文件。`WAITING_TRIGGER` 表示没有活跃订单，正在等待价格触发。
+`WAITING_TRADE` 表示已经提交订单，正在等待 IBKR 的成交、取消或过期事件。`active_order`
+为空通常应对应 `WAITING_TRIGGER`；如果存在 `active_order`，通常应对应 `WAITING_TRADE`。
+
+常见健康判断：
+
+```text
+alphaforge.service 是 active (running)
+ib-gateway 容器是 Up
+trade.jsonl 能看到 connected、reconcile_completed、portfolio_loaded、quote_stream_starting
+audit.jsonl 在持续出现 quote_no_trigger、outside_trading_window 或其他行情相关事件
+grid.yaml 里的 state 和 active_order 关系合理
+```
+
+如果修改 `/etc/alphaforge/grid.yaml`，建议先停止交易服务，避免程序运行时同时写入：
+
+```bash
+sudo systemctl stop alphaforge
+sudo cp /etc/alphaforge/grid.yaml /etc/alphaforge/grid.yaml.bak.$(date +%F-%H%M%S)
+sudo nano /etc/alphaforge/grid.yaml
+sudo systemctl start alphaforge
+sudo systemctl status alphaforge
+```
+
+## 日志轮转
+
+`install.sh` 会安装 Ubuntu 标准 `logrotate`，并把规则安装到 `/etc/logrotate.d/alphaforge`。
+日志不是等磁盘满了才删除，而是按天轮转、超过大小提前轮转、压缩旧文件、只保留固定份数：
+
+```text
+audit.jsonl    daily, maxsize 100M, rotate 14, compress
+trade.jsonl    daily, maxsize 20M,  rotate 90, compress
+service.log    daily, maxsize 20M,  rotate 30, compress
+```
+
+规则里使用 `copytruncate`，所以轮转时不需要重启 AlphaForge。
+轮转后的旧文件会带日期时间后缀并压缩，例如 `trade.jsonl-20260607-031500.gz`。
+可以用下面命令检查规则：
+
+```bash
+ls -lh /var/log/alphaforge
+sudo logrotate -d /etc/logrotate.d/alphaforge
+```
+
+如需手动强制轮转一次：
+
+```bash
+sudo logrotate -f /etc/logrotate.d/alphaforge
+```
+
+## CloudWatch Agent
+
+CloudWatch Agent 本项目不自动安装，因为它需要 AWS 侧的 IAM role、CloudWatch Logs 权限和
+账号级配置。建议在 AWS 上采集：
+
+```text
+EC2 CPU、内存、磁盘使用率
+/var/log/alphaforge/service.log
+/var/log/alphaforge/trade.jsonl
+/var/log/alphaforge/audit.jsonl
+```
+
+参考 AWS 官方文档：
+
+- [Install CloudWatch Agent](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/install-CloudWatch-Agent-on-EC2-Instance.html)
+- [CloudWatch Agent configuration file](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Agent-Configuration-File-Details.html)
+- [CloudWatch Logs getting started](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_GettingStarted.html)
 
 ## grid_v1 策略
 

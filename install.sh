@@ -14,6 +14,7 @@ ETC_DIR="/etc/alphaforge"
 LOG_DIR="/var/log/alphaforge"
 STATE_DIR="/var/lib/alphaforge"
 SERVICE_FILE="/etc/systemd/system/alphaforge.service"
+LOGROTATE_FILE="/etc/logrotate.d/alphaforge"
 
 SOURCE_DIR=""
 FILES_DIR=""
@@ -90,7 +91,7 @@ copy_always() {
 
 install_packages() {
   apt update
-  apt install -y git curl ca-certificates python3 python3-venv python3-pip docker.io rsync
+  apt install -y git curl ca-certificates python3 python3-venv python3-pip docker.io rsync logrotate
 
   if docker compose version >/dev/null 2>&1; then
     info "docker compose is already available"
@@ -215,6 +216,15 @@ install_service() {
   chmod +x "${APP_DIR}/start.sh"
 }
 
+install_logrotate() {
+  copy_always \
+    "${FILES_DIR}/etc/logrotate.d/alphaforge" \
+    "${LOGROTATE_FILE}" \
+    "0644" \
+    "root" \
+    "root"
+}
+
 reload_systemd() {
   systemctl daemon-reload
 }
@@ -232,6 +242,7 @@ Protected files, not overwritten on future installs:
 Updated on every install:
   ${ETC_DIR}/docker-compose.yml
   ${SERVICE_FILE}
+  ${LOGROTATE_FILE}
   ${APP_DIR}
   ${VENV_DIR}
 
@@ -268,8 +279,9 @@ main() {
   step "5/7" "Install configuration files"
   install_configs
 
-  step "6/7" "Install systemd service"
+  step "6/7" "Install systemd service and log rotation"
   install_service
+  install_logrotate
 
   step "7/7" "Fix runtime permissions and reload systemd"
   fix_runtime_permissions
