@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from alphaforge.core.config import Settings, load_settings
 from alphaforge.logging.event_log import EventLogger
 from alphaforge.state.grid_store import GridStateStore
@@ -9,6 +11,8 @@ from alphaforge.core.models import GridState, Portfolio, Quote
 from alphaforge.execution.order_manager import OrderManager
 from alphaforge.execution.risk import RiskManager
 from alphaforge.strategies.grid_v1 import GridStrategy
+
+PORTFOLIO_TIMEOUT_SECONDS = 10
 
 
 class TradingEngine:
@@ -48,12 +52,25 @@ class TradingEngine:
             symbols=grid_config.symbols,
         )
         try:
+            logger.trade("reconcile_started", "_system")
             await order_manager.reconcile(grid_config)
-            portfolio = await self.client.portfolio()
+            logger.trade("reconcile_completed", "_system")
+            portfolio = await self._load_portfolio(logger)
+            logger.trade(
+                "portfolio_loaded",
+                "_system",
+                net_liquidation=portfolio.net_liquidation,
+                cash=portfolio.cash,
+                positions=list(portfolio.positions),
+            )
+            logger.trade("quote_stream_starting", "_system", symbols=grid_config.symbols)
             async for quote in self.client.stream_quotes(grid_config.symbols):
                 await order_manager.drain_order_events(grid_config)
                 grid_config = self.state_store.load()
-                portfolio = await self.client.portfolio()
+                try:
+                    portfolio = await self._load_portfolio(logger)
+                except TimeoutError:
+                    continue
                 await self._handle_quote(
                     quote,
                     portfolio,
@@ -65,6 +82,16 @@ class TradingEngine:
         finally:
             self.client.disconnect()
             logger.trade("disconnected", "_system")
+
+    async def _load_portfolio(self, logger: EventLogger) -> Portfolio:
+        try:
+            return await asyncio.wait_for(
+                self.client.portfolio(),
+                timeout=PORTFOLIO_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            logger.trade("portfolio_timeout", "_system")
+            raise TimeoutError("portfolio request timed out") from exc
 
     async def _handle_quote(
         self,
