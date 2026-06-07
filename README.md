@@ -162,6 +162,27 @@ sudo docker compose --env-file /etc/alphaforge/env -f /etc/alphaforge/docker-com
 `ib-gateway` 容器需要保持 `Up`。如果 AlphaForge 无法连接 IBKR，优先查看 Docker 日志和
 VNC 登录状态，确认 IB Gateway 已经登录成功并启用 API。
 
+如果用手机登录同一个 IBKR paper 用户后，日志出现 `portfolio request timed out`、
+`accountSummaryAsync` 超时、订单/成交查询超时，通常表示 IB Gateway 登录会话被手机端干扰。
+短期恢复步骤：
+
+```bash
+sudo systemctl stop alphaforge
+sudo docker logs --tail 200 ib-gateway
+sudo docker restart ib-gateway
+sudo docker logs -f ib-gateway
+sudo /opt/alphaforge/app/start.sh
+```
+
+`start.sh` 会重新执行 doctor、启动 systemd 服务，并等待 AlphaForge 重新完成
+`connected`、`reconcile_completed`、`portfolio_loaded`、`quote_stream_starting`。
+
+Paper 常驻测试期间，尽量不要用同一个 IBKR 用户在手机上重新登录或切换会话。如果手机 App
+已经保持登录状态，可以只查看净值、持仓和订单；不要退出再登录、切换 paper/live、切换用户、
+处理重新认证提示或发起交易。如果手机端提示必须重新登录，建议先停止 AlphaForge，查看完成后
+再重启 IB Gateway 和 AlphaForge。更稳的做法是让 AWS IB Gateway 使用专门的量化登录用户，
+手机查看使用另一个登录用户。
+
 AlphaForge 日志：
 
 ```bash
@@ -194,6 +215,9 @@ trade.jsonl 能看到 connected、reconcile_completed、portfolio_loaded、quote
 audit.jsonl 在持续出现 quote_no_trigger、outside_trading_window 或其他行情相关事件
 grid.yaml 里的 state 和 active_order 关系合理
 ```
+
+如果 `trade.jsonl` 出现 `engine_session_retrying`，表示 AlphaForge 进程仍在运行，但当前
+IBKR 会话不可用，程序正在等待后重新连接、reconcile 和加载 portfolio。恢复前不会进入策略下单。
 
 如果修改 `/etc/alphaforge/grid.yaml`，建议先停止交易服务，避免程序运行时同时写入：
 

@@ -13,6 +13,8 @@ from alphaforge.execution.risk import RiskManager
 from alphaforge.strategies.grid_v1 import GridStrategy
 
 PORTFOLIO_TIMEOUT_SECONDS = 10
+SESSION_RETRY_INITIAL_SECONDS = 30
+SESSION_RETRY_MAX_SECONDS = 300
 
 
 class TradingEngine:
@@ -133,4 +135,72 @@ class TradingEngine:
 
 
 async def run_forever() -> None:
-    await TradingEngine(load_settings()).run()
+    retry_attempt = 0
+    while True:
+        settings = load_settings()
+        logger = _system_logger(settings)
+        try:
+            await TradingEngine(settings).run()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not _is_recoverable_session_error(exc):
+                logger.trade(
+                    "engine_session_failed",
+                    "_system",
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    recoverable=False,
+                )
+                raise
+
+            retry_attempt += 1
+            delay_seconds = _retry_delay_seconds(retry_attempt)
+            logger.trade(
+                "engine_session_retrying",
+                "_system",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                retry_attempt=retry_attempt,
+                delay_seconds=delay_seconds,
+            )
+            await asyncio.sleep(delay_seconds)
+            continue
+
+        retry_attempt += 1
+        delay_seconds = _retry_delay_seconds(retry_attempt)
+        logger.trade(
+            "engine_session_ended",
+            "_system",
+            retry_attempt=retry_attempt,
+            delay_seconds=delay_seconds,
+        )
+        await asyncio.sleep(delay_seconds)
+
+
+def _system_logger(settings: Settings) -> EventLogger:
+    grid_config = GridStateStore(settings.paths.grid_config).load()
+    return EventLogger(
+        settings.paths.audit_log,
+        settings.paths.trade_log,
+        grid_config.strategy_name,
+        settings.env.mode.value,
+        settings.env.account,
+        grid_config.audit_log_sample_rate,
+    )
+
+
+def _is_recoverable_session_error(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError, OSError)):
+        return True
+    if isinstance(exc, RuntimeError):
+        message = str(exc).lower()
+        return "timed out" in message or "not connected" in message
+    return False
+
+
+def _retry_delay_seconds(attempt: int) -> int:
+    return min(
+        SESSION_RETRY_INITIAL_SECONDS * max(1, attempt),
+        SESSION_RETRY_MAX_SECONDS,
+    )
