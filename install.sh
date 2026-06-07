@@ -47,11 +47,11 @@ detect_source_dir() {
 
 validate_source_workspace() {
   [[ -d "${FILES_DIR}" ]] \
-    || fail "install.sh must run from the source workspace, e.g. /home/ubuntu/AlphaForge; files/ is missing"
+    || fail "source workspace is missing files/: run from /home/ubuntu/AlphaForge"
   [[ -d "${SOURCE_DIR}/src" ]] \
-    || fail "install.sh must run from the source workspace, e.g. /home/ubuntu/AlphaForge; src/ is missing"
+    || fail "source workspace is missing src/: run from /home/ubuntu/AlphaForge"
   [[ -f "${SOURCE_DIR}/pyproject.toml" ]] \
-    || fail "install.sh must run from the source workspace, e.g. /home/ubuntu/AlphaForge; pyproject.toml is missing"
+    || fail "source workspace is missing pyproject.toml: run from /home/ubuntu/AlphaForge"
 }
 
 require_file() {
@@ -109,6 +109,8 @@ ensure_user_and_dirs() {
   fi
 
   install -d -m 0755 "${APP_DIR}" "${VENV_DIR}" "${ETC_DIR}" "${LOG_DIR}" "${STATE_DIR}"
+  chown "root:${APP_NAME}" "${ETC_DIR}"
+  chmod 1770 "${ETC_DIR}"
   chown -R "${APP_NAME}:${APP_NAME}" "${LOG_DIR}" "${STATE_DIR}"
   info "created production directories"
 }
@@ -153,7 +155,7 @@ install_python_env() {
 }
 
 # Install runtime config under /etc/alphaforge.
-# env/config.yaml are protected after first copy; docker-compose.yml is updated every install.
+# env/config.yaml/grid.yaml are protected after first copy; docker-compose.yml is updated every install.
 install_configs() {
   copy_once \
     "${FILES_DIR}/etc/alphaforge/env" \
@@ -169,12 +171,24 @@ install_configs() {
     "root" \
     "${APP_NAME}"
 
+  copy_once \
+    "${FILES_DIR}/etc/alphaforge/grid.yaml" \
+    "${ETC_DIR}/grid.yaml" \
+    "0660" \
+    "${APP_NAME}" \
+    "${APP_NAME}"
+
   copy_always \
     "${FILES_DIR}/etc/alphaforge/docker-compose.yml" \
     "${ETC_DIR}/docker-compose.yml" \
     "0644" \
     "root" \
     "root"
+
+  chown "root:${APP_NAME}" "${ETC_DIR}/env" "${ETC_DIR}/config.yaml"
+  chown "${APP_NAME}:${APP_NAME}" "${ETC_DIR}/grid.yaml"
+  chmod 0640 "${ETC_DIR}/env" "${ETC_DIR}/config.yaml"
+  chmod 0660 "${ETC_DIR}/grid.yaml"
 }
 
 # Install the systemd unit. Its ExecStart runs VENV_DIR/bin/alphaforge run.
@@ -201,6 +215,7 @@ Install complete.
 Protected files, not overwritten on future installs:
   ${ETC_DIR}/env
   ${ETC_DIR}/config.yaml
+  ${ETC_DIR}/grid.yaml
 
 Updated on every install:
   ${ETC_DIR}/docker-compose.yml

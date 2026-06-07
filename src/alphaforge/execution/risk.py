@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from alphaforge.config import RiskConfig
-from alphaforge.models import OrderIntent, Portfolio, Quote, Side
+from alphaforge.core.config import RiskConfig
+from alphaforge.core.models import OrderIntent, Portfolio, Quote, Side
 
 
 @dataclass(frozen=True)
@@ -25,9 +25,11 @@ class RiskManager:
             return RiskDecision(False, "order account does not match portfolio account")
         if intent.quantity <= 0:
             return RiskDecision(False, "order quantity must be positive")
-        if quote.spread_bps is None:
+
+        spread_bps = quote.spread_bps
+        if spread_bps is None:
             return RiskDecision(False, "quote spread is unavailable")
-        if quote.spread_bps > self.config.max_spread_bps:
+        if spread_bps > self.config.max_spread_bps:
             return RiskDecision(False, "quote spread exceeds limit")
         if portfolio.net_liquidation <= 0:
             return RiskDecision(False, "net liquidation must be positive")
@@ -40,6 +42,9 @@ class RiskManager:
             if intent.quantity > current_quantity:
                 return RiskDecision(False, "short selling is disabled")
             return RiskDecision(True, "allowed")
+
+        if intent.notional > portfolio.cash:
+            return RiskDecision(False, "cash is insufficient")
 
         if position is None and portfolio.position_count >= self.config.max_positions:
             return RiskDecision(False, "max positions reached")
@@ -54,4 +59,3 @@ class RiskManager:
             return RiskDecision(False, "gross exposure limit exceeded")
 
         return RiskDecision(True, "allowed")
-

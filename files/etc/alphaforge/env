@@ -4,4 +4,5 @@ IB_PASSWORD=
 IB_MODE=paper
 IB_ACCOUNT=
 LIVE_TRADING_ENABLED=false
+# 供 IB Gateway Docker 容器使用，Python 交易引擎不读取该项。
 AUTO_RESTART_TIME=23:45

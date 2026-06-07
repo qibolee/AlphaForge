@@ -4,9 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from alphaforge.config import RiskConfig
-from alphaforge.models import OrderIntent, Portfolio, Quote, Side
-from alphaforge.risk import RiskManager
+from alphaforge.core.config import RiskConfig
+from alphaforge.core.models import OrderIntent, Portfolio, Quote, Side
+from alphaforge.execution.risk import RiskManager
 
 
 class RiskTest(unittest.TestCase):
@@ -46,4 +46,3 @@ def _risk_config() -> RiskConfig:
 
 if __name__ == "__main__":
     unittest.main()
-

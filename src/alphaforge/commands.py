@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import socket
 import sys
 from pathlib import Path
 
-from alphaforge.config import ConfigError, load_settings
+from alphaforge.core.config import ConfigError, load_settings
 from alphaforge.engine import run_forever
 
 
@@ -43,13 +44,27 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _doctor(args: argparse.Namespace) -> int:
+def _doctor(_args: argparse.Namespace) -> int:
     settings = load_settings()
     checks = [
         ("env/config", True, f"mode={settings.env.mode.value} account={settings.env.account}"),
         ("log_dir", _writable_dir(settings.paths.log_dir), str(settings.paths.log_dir)),
         ("state_dir", _writable_dir(settings.paths.state_dir), str(settings.paths.state_dir)),
-        ("ibkr_socket", _socket_open(settings.ibkr.host, settings.ibkr_port), f"{settings.ibkr.host}:{settings.ibkr_port}"),
+        (
+            "grid_config",
+            _readable_writable_file(settings.paths.grid_config),
+            str(settings.paths.grid_config),
+        ),
+        (
+            "grid_config_dir",
+            os.access(settings.paths.grid_config.parent, os.W_OK),
+            str(settings.paths.grid_config.parent),
+        ),
+        (
+            "ibkr_socket",
+            _socket_open(settings.ibkr.host, settings.ibkr_port),
+            f"{settings.ibkr.host}:{settings.ibkr_port}",
+        ),
     ]
     ok = True
     for name, passed, message in checks:
@@ -58,7 +73,7 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
-def _run(args: argparse.Namespace) -> int:
+def _run(_args: argparse.Namespace) -> int:
     asyncio.run(run_forever())
     return 0
 
@@ -87,6 +102,10 @@ def _writable_dir(path: Path) -> bool:
         return False
 
 
+def _readable_writable_file(path: Path) -> bool:
+    return path.exists() and path.is_file() and os.access(path, os.R_OK | os.W_OK)
+
+
 def _socket_open(host: str, port: int) -> bool:
     try:
         with socket.create_connection((host, port), timeout=2):
@@ -97,4 +116,3 @@ def _socket_open(host: str, port: int) -> bool:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())
-

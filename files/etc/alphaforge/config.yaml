@@ -17,14 +17,13 @@ paths:
   log_dir: /var/log/alphaforge
   state_dir: /var/lib/alphaforge
   audit_log: /var/log/alphaforge/audit.jsonl
+  trade_log: /var/log/alphaforge/trade.jsonl
+  grid_config: /etc/alphaforge/grid.yaml
   kill_switch: /var/lib/alphaforge/kill-switch
 
 strategy:
-  universe: [SPY, QQQ, IWM, TLT, GLD]
-  bar_seconds: 60
-  cooldown_seconds: 300
-  short_ema: 3
-  long_ema: 12
+  # grid_v1 的详细参数在 /etc/alphaforge/grid.yaml。
+  name: grid_v1
 
 risk:
   max_positions: 3
@@ -32,4 +31,3 @@ risk:
   max_gross_exposure_pct: 0.30
   daily_loss_limit_pct: 0.01
   max_spread_bps: 5
-

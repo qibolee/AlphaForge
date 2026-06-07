@@ -1,132 +1,104 @@
 from __future__ import annotations
 
-import asyncio
-import json
-from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
-from math import floor
-from pathlib import Path
-
-from alphaforge.config import Settings, load_settings
-from alphaforge.ibkr import IBKRClient
-from alphaforge.models import OrderIntent, Portfolio, Quote, Side, Signal, SignalAction
-from alphaforge.risk import RiskManager
-from alphaforge.strategy import BarAggregator, MomentumStrategy
-
-
-class AuditLog:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-
-    def write(self, event: str, **payload: object) -> None:
-        record = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "event": event,
-            **{key: _jsonable(value) for key, value in payload.items()},
-        }
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+from alphaforge.core.config import Settings, load_settings
+from alphaforge.logging.event_log import EventLogger
+from alphaforge.state.grid_store import GridStateStore
+from alphaforge.adapters.ibkr import IBKRClient
+from alphaforge.core.models import GridRuntimeConfig
+from alphaforge.core.models import GridState, Portfolio, Quote
+from alphaforge.execution.order_manager import OrderManager
+from alphaforge.execution.risk import RiskManager
+from alphaforge.strategies.grid_v1 import GridStrategy
 
 
 class TradingEngine:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.audit = AuditLog(settings.paths.audit_log)
         self.client = IBKRClient(settings)
-        self.aggregator = BarAggregator(settings.strategy.bar_seconds)
-        self.strategy = MomentumStrategy(settings.strategy)
+        self.state_store = GridStateStore(settings.paths.grid_config)
         self.risk = RiskManager(settings.risk, settings.paths.kill_switch)
-        self._last_order_at: dict[str, datetime] = {}
 
     async def run(self) -> None:
         self.settings.paths.log_dir.mkdir(parents=True, exist_ok=True)
         self.settings.paths.state_dir.mkdir(parents=True, exist_ok=True)
+        grid_config = self.state_store.load()
+        logger = EventLogger(
+            self.settings.paths.audit_log,
+            self.settings.paths.trade_log,
+            grid_config.strategy_name,
+            self.settings.env.mode.value,
+            self.settings.env.account,
+            grid_config.regular_log_sample_rate,
+        )
+        strategy = GridStrategy(grid_config.trading_window)
+        order_manager = OrderManager(
+            self.client,
+            self.state_store,
+            self.risk,
+            logger,
+            self.settings.env.account,
+            strategy,
+        )
+
         await self.client.connect()
-        self.audit.write(
+        logger.trade(
             "connected",
-            mode=self.settings.env.mode.value,
-            account=self.settings.env.account,
+            "_system",
             port=self.settings.ibkr_port,
+            symbols=grid_config.symbols,
         )
         try:
+            await order_manager.reconcile(grid_config)
             portfolio = await self.client.portfolio()
-            async for quote in self.client.stream_quotes(self.settings.strategy.universe):
-                bar = self.aggregator.update(quote)
-                if bar is None:
-                    continue
+            async for quote in self.client.stream_quotes(grid_config.symbols):
+                await order_manager.drain_order_events(grid_config)
+                grid_config = self.state_store.load()
                 portfolio = await self.client.portfolio()
-                for signal in self.strategy.on_bar(bar, portfolio):
-                    await self._handle_signal(signal, quote, portfolio)
+                await self._handle_quote(
+                    quote,
+                    portfolio,
+                    grid_config,
+                    strategy,
+                    order_manager,
+                    logger,
+                )
         finally:
             self.client.disconnect()
-            self.audit.write("disconnected")
+            logger.trade("disconnected", "_system")
 
-    async def _handle_signal(self, signal: Signal, quote: Quote, portfolio: Portfolio) -> None:
-        self.audit.write("signal", signal=signal)
-        if not self._cooldown_ok(signal.symbol):
-            self.audit.write("signal_skipped", symbol=signal.symbol, reason="cooldown")
+    async def _handle_quote(
+        self,
+        quote: Quote,
+        portfolio: Portfolio,
+        grid_config: GridRuntimeConfig,
+        strategy: GridStrategy,
+        order_manager: OrderManager,
+        logger: EventLogger,
+    ) -> None:
+        grid = grid_config.grid_for(quote.symbol)
+        if grid is None:
+            logger.regular("quote_unconfigured_symbol", quote.symbol, quote=quote)
             return
-        intent = _order_from_signal(signal, quote, portfolio, self.settings)
-        if intent is None:
-            self.audit.write("signal_skipped", symbol=signal.symbol, reason="no_order_intent")
-            return
-        decision = self.risk.check(intent, portfolio, quote)
-        if not decision.allowed:
-            self.audit.write("risk_rejected", reason=decision.reason, intent=intent)
-            return
-        broker_order_id = await self.client.place_limit_order(intent)
-        self._last_order_at[intent.symbol] = datetime.now(timezone.utc)
-        self.audit.write("order_submitted", broker_order_id=broker_order_id, intent=intent)
 
-    def _cooldown_ok(self, symbol: str) -> bool:
-        last = self._last_order_at.get(symbol)
-        if last is None:
-            return True
-        age = (datetime.now(timezone.utc) - last).total_seconds()
-        return age >= self.settings.strategy.cooldown_seconds
+        evaluation = strategy.evaluate(grid, quote, portfolio)
+        if evaluation.cancel_active_order:
+            await order_manager.cancel_if_needed(grid_config, grid, evaluation.reason)
+            return
+        if grid.state == GridState.WAITING_TRADE:
+            logger.regular(evaluation.reason or "waiting_existing_order", grid.symbol, quote=quote)
+            return
+        if evaluation.trigger is None:
+            logger.regular(evaluation.reason or "quote_no_trigger", grid.symbol, quote=quote)
+            return
+
+        await order_manager.submit_trigger(
+            grid_config,
+            grid,
+            evaluation.trigger,
+            quote,
+            portfolio,
+        )
 
 
 async def run_forever() -> None:
     await TradingEngine(load_settings()).run()
-
-
-def _order_from_signal(
-    signal: Signal,
-    quote: Quote,
-    portfolio: Portfolio,
-    settings: Settings,
-) -> OrderIntent | None:
-    price = quote.mid
-    if price is None or price <= 0:
-        return None
-    if signal.action == SignalAction.BUY:
-        max_notional = portfolio.net_liquidation * settings.risk.max_symbol_position_pct
-        quantity = floor(max_notional / price)
-        if quantity <= 0:
-            return None
-        limit = round((quote.ask or price) * 1.0005, 2)
-        return OrderIntent(signal.symbol, Side.BUY, quantity, portfolio.account_id, limit, signal.reason)
-    if signal.action == SignalAction.SELL:
-        position = portfolio.position(signal.symbol)
-        quantity = floor(position.quantity) if position else 0
-        if quantity <= 0:
-            return None
-        limit = round((quote.bid or price) * 0.9995, 2)
-        return OrderIntent(signal.symbol, Side.SELL, quantity, portfolio.account_id, limit, signal.reason)
-    return None
-
-
-def _jsonable(value: object) -> object:
-    if is_dataclass(value):
-        return _jsonable(asdict(value))
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if hasattr(value, "value"):
-        return value.value
-    return value
-

@@ -4,8 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from alphaforge.config import ConfigError, load_settings
-from alphaforge.models import Mode
+from alphaforge.core.config import ConfigError, load_settings
+from alphaforge.core.models import Mode
 
 
 class ConfigTest(unittest.TestCase):
@@ -16,7 +16,8 @@ class ConfigTest(unittest.TestCase):
 
         self.assertEqual(settings.env.mode, Mode.PAPER)
         self.assertEqual(settings.ibkr_port, 4002)
-        self.assertEqual(settings.strategy.universe, ("SPY", "QQQ"))
+        self.assertEqual(settings.strategy.name, "grid_v1")
+        self.assertEqual(settings.paths.grid_config, Path("/tmp/alphaforge-grid.yaml"))
 
     def test_live_requires_explicit_enable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -37,7 +38,6 @@ def _write_files(tmp: Path, mode: str, live_enabled: bool = False) -> tuple[Path
                 f"IB_MODE={mode}",
                 "IB_ACCOUNT=DU123",
                 f"LIVE_TRADING_ENABLED={'true' if live_enabled else 'false'}",
-                "AUTO_RESTART_TIME=23:45",
             ]
         )
     )
@@ -53,13 +53,11 @@ paths:
   log_dir: /tmp/alphaforge-log
   state_dir: /tmp/alphaforge-state
   audit_log: /tmp/alphaforge-log/audit.jsonl
+  trade_log: /tmp/alphaforge-log/trade.jsonl
+  grid_config: /tmp/alphaforge-grid.yaml
   kill_switch: /tmp/alphaforge-state/kill-switch
 strategy:
-  universe: [SPY, QQQ]
-  bar_seconds: 60
-  cooldown_seconds: 300
-  short_ema: 3
-  long_ema: 12
+  name: grid_v1
 risk:
   max_positions: 3
   max_symbol_position_pct: 0.10
@@ -73,4 +71,3 @@ risk:
 
 if __name__ == "__main__":
     unittest.main()
-

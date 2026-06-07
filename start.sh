@@ -32,6 +32,7 @@ check_install_outputs() {
   id "${RUN_USER}" >/dev/null 2>&1 || fail "missing system user ${RUN_USER}; run install.sh first"
   [[ -f "${ETC_DIR}/env" ]] || fail "missing ${ETC_DIR}/env; fill in account settings"
   [[ -f "${ETC_DIR}/config.yaml" ]] || fail "missing ${ETC_DIR}/config.yaml; run install.sh first"
+  [[ -f "${ETC_DIR}/grid.yaml" ]] || fail "missing ${ETC_DIR}/grid.yaml; run install.sh first"
   [[ -f "${ETC_DIR}/docker-compose.yml" ]] || fail "missing ${ETC_DIR}/docker-compose.yml"
   [[ -f "${SERVICE_FILE}" ]] || fail "missing ${SERVICE_FILE}; run install.sh first"
   [[ -x "${ALPHAFORGE_BIN}" ]] || fail "missing ${ALPHAFORGE_BIN}; run install.sh first"
@@ -77,6 +78,7 @@ AlphaForge started.
 
 Logs:
   sudo journalctl -u ${SERVICE_NAME} -f
+  sudo tail -f /var/log/alphaforge/trade.jsonl
   sudo tail -f /var/log/alphaforge/audit.jsonl
   sudo tail -f /var/log/alphaforge/service.log
 

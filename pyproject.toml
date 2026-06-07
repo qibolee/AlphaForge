@@ -20,7 +20,7 @@ dev = [
 ]
 
 [project.scripts]
-alphaforge = "alphaforge.cli:main"
+alphaforge = "alphaforge.commands:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
