@@ -5,6 +5,7 @@ import asyncio
 import os
 import socket
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from alphaforge.core.config import ConfigError, load_settings
@@ -74,6 +75,7 @@ def _doctor(_args: argparse.Namespace) -> int:
 
 
 def _run(_args: argparse.Namespace) -> int:
+    _enable_timestamped_service_output()
     asyncio.run(run_forever())
     return 0
 
@@ -111,6 +113,32 @@ def _socket_open(host: str, port: int) -> bool:
         with socket.create_connection((host, port), timeout=2):
             return True
     except OSError:
+        return False
+
+
+def _enable_timestamped_service_output() -> None:
+    sys.stdout = _TimestampedStream(sys.stdout)
+    sys.stderr = _TimestampedStream(sys.stderr)
+
+
+class _TimestampedStream:
+    def __init__(self, stream: object) -> None:
+        self.stream = stream
+        self._line_start = True
+
+    def write(self, text: str) -> int:
+        for chunk in text.splitlines(keepends=True):
+            if self._line_start and chunk:
+                self.stream.write(f"{datetime.now(timezone.utc).isoformat()} ")
+            self.stream.write(chunk)
+            self._line_start = chunk.endswith("\n")
+        self.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        self.stream.flush()
+
+    def isatty(self) -> bool:
         return False
 
 

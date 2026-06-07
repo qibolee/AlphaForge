@@ -25,6 +25,7 @@ class IBKRClient:
         self._module: Any | None = None
         self._order_events: asyncio.Queue[OrderEvent] = asyncio.Queue()
         self._trades_by_order_id: dict[int, Any] = {}
+        self._runtime_warnings: list[str] = []
 
     async def connect(self) -> None:
         module = _load_ib_async()
@@ -89,7 +90,7 @@ class IBKRClient:
         tickers = []
         for symbol in symbols:
             contract = module.Stock(symbol, "SMART", "USD")
-            await _with_timeout(
+            await self._with_timeout(
                 self._ib.qualifyContractsAsync(contract),
                 f"qualify contract {symbol}",
             )
@@ -111,7 +112,7 @@ class IBKRClient:
 
         module = self._module
         contract = module.Stock(intent.symbol, "SMART", "USD")
-        await _with_timeout(
+        await self._with_timeout(
             self._ib.qualifyContractsAsync(contract),
             f"qualify contract {intent.symbol}",
         )
@@ -147,7 +148,7 @@ class IBKRClient:
         self._require_connected()
         req_open_orders = getattr(self._ib, "reqOpenOrdersAsync", None)
         if req_open_orders is not None:
-            await _with_timeout(req_open_orders(), "open orders request", required=False)
+            await self._with_timeout(req_open_orders(), "open orders request", required=False)
             await asyncio.sleep(1)
 
         events: list[OrderEvent] = []
@@ -159,10 +160,15 @@ class IBKRClient:
 
         req_executions = getattr(self._ib, "reqExecutionsAsync", None)
         if req_executions is not None:
-            fills = await _with_timeout(req_executions(), "executions request", required=False)
+            fills = await self._with_timeout(req_executions(), "executions request", required=False)
             for fill in fills or []:
                 events.append(_execution_event(None, fill))
         return events
+
+    def drain_runtime_warnings(self) -> list[str]:
+        warnings = list(self._runtime_warnings)
+        self._runtime_warnings.clear()
+        return warnings
 
     def get_order_event_nowait(self) -> OrderEvent | None:
         try:
@@ -206,6 +212,21 @@ class IBKRClient:
         if self._ib is None or not self._ib.isConnected():
             raise RuntimeError("IBKR client is not connected")
 
+    async def _with_timeout(
+        self,
+        awaitable: Any,
+        label: str,
+        required: bool = True,
+    ) -> Any | None:
+        try:
+            return await asyncio.wait_for(awaitable, timeout=IB_REQUEST_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError as exc:
+            self._runtime_warnings.append(label)
+            print(f"{label} timed out", flush=True)
+            if required:
+                raise RuntimeError(f"{label} timed out") from exc
+            return None
+
 
 def _load_ib_async() -> Any:
     try:
@@ -213,16 +234,6 @@ def _load_ib_async() -> Any:
     except ImportError as exc:  # pragma: no cover - installed on AWS by install.sh.
         raise RuntimeError("ib_async is not installed; run install.sh") from exc
     return ib_async
-
-
-async def _with_timeout(awaitable: Any, label: str, required: bool = True) -> Any | None:
-    try:
-        return await asyncio.wait_for(awaitable, timeout=IB_REQUEST_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError as exc:
-        print(f"{label} timed out", flush=True)
-        if required:
-            raise RuntimeError(f"{label} timed out") from exc
-        return None
 
 
 def _trade_event(event_type: OrderEventType, trade: Any) -> OrderEvent:

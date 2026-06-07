@@ -54,6 +54,7 @@ class TradingEngine:
         try:
             logger.trade("reconcile_started", "_system")
             await order_manager.reconcile(grid_config)
+            self._log_ibkr_warnings(logger)
             logger.trade("reconcile_completed", "_system")
             portfolio = await self._load_portfolio(logger)
             logger.trade(
@@ -82,6 +83,10 @@ class TradingEngine:
         finally:
             self.client.disconnect()
             logger.trade("disconnected", "_system")
+
+    def _log_ibkr_warnings(self, logger: EventLogger) -> None:
+        for request in self.client.drain_runtime_warnings():
+            logger.trade("ibkr_request_timeout", "_system", request=request)
 
     async def _load_portfolio(self, logger: EventLogger) -> Portfolio:
         try:
