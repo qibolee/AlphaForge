@@ -26,8 +26,8 @@ strategy:
   name: grid_v1
 
 risk:
-  max_positions: 3
-  max_symbol_position_pct: 0.10
-  max_gross_exposure_pct: 0.30
+  max_positions: 5
+  max_symbol_position_pct: 0.01
+  max_gross_exposure_pct: 0.05
   daily_loss_limit_pct: 0.01
-  max_spread_bps: 5
+  max_spread_bps: 100
