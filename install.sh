@@ -146,12 +146,13 @@ sync_app() {
 }
 
 # Install the production Python runtime.
-# pip reads APP_DIR/pyproject.toml, installs ib_async/PyYAML, and creates VENV_DIR/bin/alphaforge.
+# python -m pip reads APP_DIR/pyproject.toml, installs ib_async/PyYAML, and creates VENV_DIR/bin/alphaforge.
 # The -e install keeps alphaforge pointed at APP_DIR/src after each install.
 install_python_env() {
   python3 -m venv "${VENV_DIR}"
-  "${VENV_DIR}/bin/pip" install --upgrade pip
-  "${VENV_DIR}/bin/pip" install -e "${APP_DIR}"
+  "${VENV_DIR}/bin/python" -m ensurepip --upgrade
+  "${VENV_DIR}/bin/python" -m pip install --upgrade pip
+  "${VENV_DIR}/bin/python" -m pip install -e "${APP_DIR}"
 }
 
 fix_runtime_permissions() {
@@ -161,6 +162,8 @@ fix_runtime_permissions() {
   chmod 0750 "${APP_ROOT}"
   chown -R "root:${APP_NAME}" "${APP_DIR}" "${VENV_DIR}"
   chmod -R u+rwX,g+rX,o-rwx "${APP_DIR}" "${VENV_DIR}"
+  [[ -f "${VENV_DIR}/bin/alphaforge" ]] && chmod 0750 "${VENV_DIR}/bin/alphaforge"
+  [[ -f "${APP_DIR}/start.sh" ]] && chmod 0750 "${APP_DIR}/start.sh"
 }
 
 # Install runtime config under /etc/alphaforge.
