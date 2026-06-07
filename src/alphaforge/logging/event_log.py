@@ -58,7 +58,7 @@ class EventLogger:
     @staticmethod
     def _append(path: Path, record: dict[str, object]) -> None:
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
 def _jsonable(value: object) -> object:
