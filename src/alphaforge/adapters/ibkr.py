@@ -137,8 +137,9 @@ class IBKRClient:
 
     async def reconcile_order_events(self) -> list[OrderEvent]:
         self._require_connected()
-        if hasattr(self._ib, "reqOpenOrders"):
-            self._ib.reqOpenOrders()
+        req_open_orders = getattr(self._ib, "reqOpenOrdersAsync", None)
+        if req_open_orders is not None:
+            await req_open_orders()
             await asyncio.sleep(1)
 
         events: list[OrderEvent] = []

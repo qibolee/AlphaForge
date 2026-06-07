@@ -154,6 +154,15 @@ install_python_env() {
   "${VENV_DIR}/bin/pip" install -e "${APP_DIR}"
 }
 
+fix_runtime_permissions() {
+  # install.sh runs as root, but systemd runs AlphaForge as the alphaforge user.
+  # The app and venv should be owned by root, readable/executable by the alphaforge group.
+  chown "root:${APP_NAME}" "${APP_ROOT}"
+  chmod 0750 "${APP_ROOT}"
+  chown -R "root:${APP_NAME}" "${APP_DIR}" "${VENV_DIR}"
+  chmod -R u+rwX,g+rX,o-rwx "${APP_DIR}" "${VENV_DIR}"
+}
+
 # Install runtime config under /etc/alphaforge.
 # env/config.yaml/grid.yaml are protected after first copy; docker-compose.yml is updated every install.
 install_configs() {
@@ -259,7 +268,8 @@ main() {
   step "6/7" "Install systemd service"
   install_service
 
-  step "7/7" "Reload systemd"
+  step "7/7" "Fix runtime permissions and reload systemd"
+  fix_runtime_permissions
   reload_systemd
 
   print_summary
