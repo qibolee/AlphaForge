@@ -1,0 +1,29 @@
+# AlphaForge 引擎配置（基础设施层，所有机器一致；引擎只读不写）。
+# 账号密钥见 config/env；网格策略参数见 config/grid.yaml。
+ibkr:
+  host: 127.0.0.1
+  paper_host_port: 4002    # paper 模式连接的 host 端口
+  live_host_port: 4001     # live 模式连接的 host 端口
+  client_id: 10            # IBKR API clientId，一个 Gateway 会话内勿重复
+  market_data_type: 3      # 3 = delayed，无实时行情订阅时也能先跑通
+
+# 容器内路径：docker-compose 把 ./config ./state ./logs 挂到 /app 下。
+paths:
+  log_dir: /app/logs
+  state_dir: /app/state
+  audit_log: /app/logs/audit.jsonl
+  trade_log: /app/logs/trade.jsonl
+  grid_config: /app/config/grid.yaml       # 策略声明(spec)，引擎只读
+  grid_state: /app/state/grid_state.json    # 运行态(status)，引擎独占读写
+  kill_switch: /app/state/kill-switch
+  heartbeat: /app/state/heartbeat.json      # 引擎心跳(liveness)，healthcheck/status 读取
+
+strategy:
+  name: grid_v1            # 详细参数在 config/grid.yaml
+
+risk:
+  max_positions: 5
+  max_symbol_position_pct: 0.01
+  max_gross_exposure_pct: 0.05
+  daily_loss_limit_pct: 0.01
+  max_spread_bps: 100

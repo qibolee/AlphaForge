@@ -1,332 +1,305 @@
-# AlphaForge
+# AlphaForge — AWS · IBKR 网格交易引擎
 
-AlphaForge 是一套运行在 AWS us-east-1 EC2 上的 IBKR 量化交易程序。
-IB Gateway 用 Docker Compose 运行，Python 交易程序运行在 host 的 venv 中，并由
-systemd 管理。
+一套自托管、单命令运维的网格交易程序。跑在你自己的 AWS us-east-1 实例上：**IB Gateway** 与 **交易引擎** 都以容器形式由 `docker compose` 管理，整个项目自包含在一个目录里——配置、状态、日志全在眼皮底下，一个 `afctl` 收敛所有日常操作。
 
-## 目录关系
+- **项目即运行时**：`git clone` 出来的目录就是运行目录，不再 copy 到 `/etc`、`/opt`、`/var`。
+- **全容器化**：引擎打成镜像，和 IB Gateway 一起 `docker compose` 管理；崩溃自动重启、开机自启，无人值守。
+- **单一入口**：`./afctl status|logs|grid|edit|kill|update`，不用再记 systemctl / journalctl / docker / `/var/log` 一堆路径。
+- **更新有安全网**：`./afctl update` 会先跑验收单测，测试不过就**不重启**，避免改坏已跑通的交易链路。
 
-```text
-/home/ubuntu/AlphaForge
-  用途：Git clone 得到的源码工作区，用于 git pull 和 sudo ./install.sh。
-  创建/维护：由用户 git clone 创建，用户通过 git pull 更新。
-  主要内容：src/、files/、tests/、install.sh、start.sh、pyproject.toml、README.md。
+> ⚠️ 交易有风险。默认 `paper`（模拟盘）。切到 `live` 需显式 `LIVE_TRADING_ENABLED=true`，请自行承担实盘风险。
 
-/opt/alphaforge/app
-  用途：生产运行代码目录，systemd 的 WorkingDirectory 指向这里。
-  创建/维护：由 install.sh 从源码工作区同步生成；只同步运行所需文件，files/、tests/ 和 install.sh 不同步进来。
+---
 
-/opt/alphaforge/venv
-  用途：生产 Python 虚拟环境，提供 /opt/alphaforge/venv/bin/alphaforge。
-  创建/维护：由 install.sh 创建和更新。
+## 目录
+1. [架构](#架构)
+2. [部署：三步上线](#部署三步上线)
+3. [日常管理（afctl）](#日常管理afctl)
+4. [配置说明](#配置说明)
+5. [grid_v1 策略](#grid_v1-策略)
+6. [日志与状态观测](#日志与状态观测)
+7. [更新与回滚](#更新与回滚)
+8. [故障排查](#故障排查)
+9. [本地测试](#本地测试)
+10. [目录结构](#目录结构)
 
-/etc/alphaforge
-  用途：生产配置目录，保存 env、config.yaml、grid.yaml、docker-compose.yml。
-  创建/维护：由 install.sh 创建；env/config.yaml/grid.yaml 首次创建后不覆盖，docker-compose.yml 每次安装更新。
+---
 
-/etc/systemd/system/alphaforge.service
-  用途：systemd 服务文件，定义 AlphaForge 如何作为后台服务运行。
-  创建/维护：由 install.sh 每次安装更新。
+## 架构
 
-/var/log/alphaforge
-  用途：日志目录，保存 service.log、trade.jsonl 和 audit.jsonl。
-  创建/维护：由 install.sh 创建，运行时由 alphaforge 服务写入。
-
-/var/lib/alphaforge
-  用途：状态目录，保存 kill-switch 和轻量状态文件。
-  创建/维护：由 install.sh 创建，运行时由 alphaforge 服务读写。
+```
+        本仓库目录 (git clone = 运行时)
+        │
+        ├── docker compose
+        │     ├── ib-gateway   ── 用 config/env 账号自动登录，发布 127.0.0.1:4001/4002
+        │     ├── engine       ── 本仓库代码镜像；network_mode: host，连 127.0.0.1:4002
+        │     │                    挂载 ./config ./state ./logs 到容器 /app 下
+        │     └── watchdog     ── 盯 state/heartbeat.json，引擎异常时推微信告警
+        │
+        └── afctl              ── 唯一控制入口（status / logs / grid / edit / kill / update）
 ```
 
-简单理解：`/home/ubuntu/AlphaForge` 是源码；`/opt/alphaforge` 是程序运行环境；
-`/etc/alphaforge` 是配置；`/var/log` 和 `/var/lib` 是运行产物。
+- **职责分离**：`ib-gateway` 是「管道」——用 `config/env` 账号经 IBC 自动登录、维持到 IBKR 的连接；`engine` 是「大脑」——跑网格策略、下单撤单。引擎**从不直连 IBKR**，行情与订单全经 gateway 转发（`engine → 127.0.0.1:4002 → gateway → IBKR`）。因此重启引擎不会断开券商登录，`afctl update` 也只重建 engine 镜像。
+- **引擎用 host 网络**，连接 `127.0.0.1:4002`（paper）/ `4001`（live），与重构前的 host venv 行为完全一致。
+- **凭证不进镜像**：`config/env` 通过卷挂载进容器，`.dockerignore` 排除 `config/`。
+- **自愈**：两个容器 `restart: always`；引擎自身还有断线指数退避重连（30s→300s）。Docker 开机自启即全栈自启。
+- **可观测**：引擎每 ~15s 写一次心跳 `state/heartbeat.json`（计时驱动，行情清淡也不会过期）；`docker compose` 据此对引擎做 `healthcheck`（`alphaforge healthz`），`compose ps` 显示 healthy/unhealthy，`./afctl status` 显示心跳新鲜度与会话阶段。
+- **主动告警**（可选）：填 `config/env` 的 `SERVERCHAN_SENDKEY`（Server酱→微信）即启用。引擎内对关键事件（崩溃 / 拒单熔断 / 热加载失败）实时推送；独立 `watchdog` 容器盯心跳——**引擎进程死了也能告警**（死进程无法自报）。
 
-`install.sh` 必须从源码工作区执行：
+---
+
+## 部署：三步上线
+
+在 AWS 实例上（Ubuntu，root / sudo）：
 
 ```bash
-cd /home/ubuntu/AlphaForge
-sudo ./install.sh
+# 1) 拉代码
+git clone <你的GitHub地址> AlphaForge && cd AlphaForge
+
+# 2) 一键部署（首次会自动装 Docker，并创建 config/env 后停下）
+sudo ./start.sh
+vim config/env            # 填 IB_USERNAME / IB_PASSWORD / IB_ACCOUNT
+
+# 3) 再跑一次，拉起服务
+sudo ./start.sh
 ```
 
-它会把运行所需代码同步到 `/opt/alphaforge/app`，并排除 `files/`、`tests/`、`install.sh` 等安装和测试文件。
-生产启动统一使用：
+`start.sh` 是幂等的，可反复执行。完成后用 `./afctl status` 确认两个容器都 `running`、`4001/4002` 在监听。
+
+**为什么要跑两次**：第一次检测到还没有 `config/env`，创建模板后**主动退出**（没凭证无法启动）；填好账号再跑第二次，才会构建镜像、拉起容器、做健康自检。
+
+**`start.sh` vs `afctl up`**：两者核心都是 `docker compose up -d`（建+起）。`start.sh` 是「首次部署」超集——多了装 Docker、建配置模板、校验凭证、启动后自检与命令清单；`afctl up` 是「日常拉起」精简版（假设机器已就绪）。**第二次 `start.sh` 后容器已在运行，无需再 `afctl up`**；且容器 `restart: always`，机器重启会自动拉起，两条命令通常都不用敲。
+
+---
+
+## 日常管理（afctl）
 
 ```bash
-sudo /opt/alphaforge/app/start.sh
+sudo ./afctl up               构建并启动（gateway + engine）
+sudo ./afctl stop             停止容器（保留，不删除）
+sudo ./afctl restart          重启容器
+sudo ./afctl down             停止并移除容器
+
+./afctl status                服务/容器/端口/网格 一屏看全
+./afctl logs                  引擎运行日志（默认）
+./afctl logs trade            交易事件日志（连接/触发/成交/撤单/风控）
+./afctl logs gateway          IB Gateway 登录/会话日志
+./afctl logs audit            采样后的常规事件（行情/未触发等）
+./afctl grid                  查看策略声明(spec) + 运行态(status)
+
+sudo ./afctl edit             改策略声明 grid.yaml（引擎热加载，无需停服务）
+sudo ./afctl resume [标的]    解除引擎对某标的的熔断（下单被拒后自动暂停）
+sudo ./afctl kill on|off      紧急停止/恢复下单（撤单与状态仍正常）
+./afctl kill status           查看 kill switch 状态
+
+./afctl doctor                引擎自检（配置/路径/IBKR 端口）
+./afctl test                  运行验收单测（paper 安全网）
+sudo ./afctl update           git pull → 重建 → 跑测试 → 重启
 ```
 
-## 源码结构
+---
 
-```text
-commands.py   alphaforge doctor/run/kill 命令入口。
-engine.py     交易程序编排和主循环。
-core/         基础配置和领域模型。
-adapters/     外部系统适配，当前主要是 IBKR。
-strategies/   策略逻辑，当前是 grid_v1。
-execution/    下单、撤单、风控、订单状态处理。
-state/        状态文件读写。
-logging/      日志记录，当前写 trade.jsonl 和 audit.jsonl。
-```
+## 配置说明
 
-## 首次安装
+三个文件，职责清晰：
+
+| 文件 | 是否提交 | 内容 | 谁写 |
+|---|---|---|---|
+| `config/env` | 否（gitignore） | IB 账号密钥、paper/live 模式、Server酱 SendKey（可选告警） | 你 |
+| `config/config.yaml` | 是 | IBKR 端口、容器内路径、风控阈值 | 你（很少改） |
+| `config/grid.yaml` | 否（gitignore） | **策略声明 spec**：网格参数 | **只有你** |
+| `state/grid_state.json` | 否（gitignore） | **运行态 status**：演化后的 base_price、订单、状态 | **只有引擎** |
+
+仓库里只放模板 `config/env.example` 和 `config/grid.example.yaml`，`start.sh` 首次会复制成真文件。因为这些都被 gitignore，`./afctl update` 的 `git pull` **不会**和你的配置/运行态冲突。
+
+**声明与运行态分离**是这次重构的关键：`grid.yaml` 是你的「声明」，引擎**只读、绝不写回**，所以可以**在引擎运行时直接改**——
 
 ```bash
-git clone git@github.com:qibolee/AlphaForge.git
-cd AlphaForge
-sudo ./install.sh
-sudo nano /etc/alphaforge/env
-sudo /opt/alphaforge/app/start.sh
+sudo ./afctl edit     # 备份 → $EDITOR 打开 → 校验；引擎下一轮(数秒)自动热加载，无需停服务
 ```
 
-## 更新安装
+`edit` 会先校验再生效；即使存错了语法，引擎也会继续用上一份有效配置运行（不会崩），并提示你备份位置。引擎的运行态写在 `state/grid_state.json`，不要手改，用 `./afctl grid` 查看。
 
-```bash
-cd /home/ubuntu/AlphaForge
-git pull
-sudo ./install.sh
-sudo /opt/alphaforge/app/start.sh
-```
-
-## 配置覆盖规则
-
-首次执行 `install.sh` 会创建：
-
-```text
-/etc/alphaforge/env
-/etc/alphaforge/config.yaml
-/etc/alphaforge/grid.yaml
-```
-
-再次执行 `install.sh` 不会覆盖这些文件，避免覆盖已经填写好的真实账户信息、本机参数和策略状态。
-
-每次执行 `install.sh` 会更新：
-
-```text
-/etc/alphaforge/docker-compose.yml
-/etc/systemd/system/alphaforge.service
-/etc/logrotate.d/alphaforge
-/opt/alphaforge/app
-/opt/alphaforge/venv
-```
-
-## IB Gateway 端口
-
-`files/etc/alphaforge/docker-compose.yml` 中不要把端口改成同端口映射。
-
-```yaml
-ports:
-  - "127.0.0.1:4002:4004"
-  - "127.0.0.1:4001:4003"
-```
-
-Docker 映射格式是 `host_ip:host_port:container_port`。当前镜像中：
-
-```text
-container 4004 = paper relay
-container 4003 = live relay
-```
-
-所以 Python 程序仍连接 host 常用端口：
-
-```text
-paper -> 127.0.0.1:4002
-live  -> 127.0.0.1:4001
-```
-
-## 常驻运行与观测
-
-AlphaForge 在 AWS 上常驻运行时，建议从服务、Docker、日志、策略状态四个角度观察。
-
-服务状态：
-
-```bash
-sudo systemctl status alphaforge
-sudo systemctl is-active alphaforge
-sudo systemctl cat alphaforge
-sudo journalctl -u alphaforge -n 100 --no-pager
-sudo journalctl -u alphaforge -f
-```
-
-`systemctl status` 看到 `active (running)` 表示 Python 交易服务正在运行。`systemctl cat`
-可以确认 systemd 实际执行的命令，目前应为 `/opt/alphaforge/venv/bin/alphaforge run`。
-
-IB Gateway Docker 状态：
-
-```bash
-sudo docker ps -a --filter "name=^/ib-gateway$"
-sudo docker logs --tail 100 ib-gateway
-sudo docker logs -f ib-gateway
-sudo docker compose --env-file /etc/alphaforge/env -f /etc/alphaforge/docker-compose.yml ps
-sudo docker compose --env-file /etc/alphaforge/env -f /etc/alphaforge/docker-compose.yml logs -f
-```
-
-`ib-gateway` 容器需要保持 `Up`。如果 AlphaForge 无法连接 IBKR，优先查看 Docker 日志和
-VNC 登录状态，确认 IB Gateway 已经登录成功并启用 API。
-
-如果用手机登录同一个 IBKR paper 用户后，日志出现 `portfolio request timed out`、
-`accountSummaryAsync` 超时、订单/成交查询超时，通常表示 IB Gateway 登录会话被手机端干扰。
-短期恢复步骤：
-
-```bash
-sudo systemctl stop alphaforge
-sudo docker logs --tail 200 ib-gateway
-sudo docker restart ib-gateway
-sudo docker logs -f ib-gateway
-sudo /opt/alphaforge/app/start.sh
-```
-
-`start.sh` 会重新执行 doctor、启动 systemd 服务，并等待 AlphaForge 重新完成
-`connected`、`reconcile_completed`、`portfolio_loaded`、`quote_stream_starting`。
-
-Paper 常驻测试期间，尽量不要用同一个 IBKR 用户在手机上重新登录或切换会话。如果手机 App
-已经保持登录状态，可以只查看净值、持仓和订单；不要退出再登录、切换 paper/live、切换用户、
-处理重新认证提示或发起交易。如果手机端提示必须重新登录，建议先停止 AlphaForge，查看完成后
-再重启 IB Gateway 和 AlphaForge。更稳的做法是让 AWS IB Gateway 使用专门的量化登录用户，
-手机查看使用另一个登录用户。
-
-AlphaForge 日志：
-
-```bash
-sudo journalctl -u alphaforge -f
-sudo tail -f /var/log/alphaforge/trade.jsonl
-sudo tail -f /var/log/alphaforge/service.log
-sudo tail -f /var/log/alphaforge/audit.jsonl
-```
-
-`service.log` 是服务 stdout/stderr，主要用于查看异常堆栈和底层库提示。`trade.jsonl`
-只记录交易关键事件，例如连接、reconcile、组合加载、触发下单、订单成交、撤单和风控拒绝。
-`audit.jsonl` 记录交易事件和采样后的常规事件，例如行情查询、未触发、非交易窗口等。
-
-策略状态：
-
-```bash
-sudo cat /etc/alphaforge/grid.yaml
-```
-
-`grid.yaml` 是网格策略参数和状态文件。`WAITING_TRIGGER` 表示没有活跃订单，正在等待价格触发。
-`WAITING_TRADE` 表示已经提交订单，正在等待 IBKR 的成交、取消或过期事件。`active_order`
-为空通常应对应 `WAITING_TRIGGER`；如果存在 `active_order`，通常应对应 `WAITING_TRADE`。
-
-常见健康判断：
-
-```text
-alphaforge.service 是 active (running)
-ib-gateway 容器是 Up
-trade.jsonl 能看到 connected、reconcile_completed、portfolio_loaded、quote_stream_starting
-audit.jsonl 在持续出现 quote_no_trigger、outside_trading_window 或其他行情相关事件
-grid.yaml 里的 state 和 active_order 关系合理
-```
-
-如果 `trade.jsonl` 出现 `engine_session_retrying`，表示 AlphaForge 进程仍在运行，但当前
-IBKR 会话不可用，程序正在等待后重新连接、reconcile 和加载 portfolio。恢复前不会进入策略下单。
-
-如果修改 `/etc/alphaforge/grid.yaml`，建议先停止交易服务，避免程序运行时同时写入：
-
-```bash
-sudo systemctl stop alphaforge
-sudo cp /etc/alphaforge/grid.yaml /etc/alphaforge/grid.yaml.bak.$(date +%F-%H%M%S)
-sudo nano /etc/alphaforge/grid.yaml
-sudo systemctl start alphaforge
-sudo systemctl status alphaforge
-```
-
-## 日志轮转
-
-`install.sh` 会安装 Ubuntu 标准 `logrotate`，并把规则安装到 `/etc/logrotate.d/alphaforge`。
-日志不是等磁盘满了才删除，而是按天轮转、超过大小提前轮转、压缩旧文件、只保留固定份数：
-
-```text
-audit.jsonl    daily, maxsize 100M, rotate 14, compress
-trade.jsonl    daily, maxsize 20M,  rotate 90, compress
-service.log    daily, maxsize 20M,  rotate 30, compress
-```
-
-规则里使用 `copytruncate`，所以轮转时不需要重启 AlphaForge。
-轮转后的旧文件会带日期时间后缀并压缩，例如 `trade.jsonl-20260607-031500.gz`。
-可以用下面命令检查规则：
-
-```bash
-ls -lh /var/log/alphaforge
-sudo logrotate -d /etc/logrotate.d/alphaforge
-```
-
-如需手动强制轮转一次：
-
-```bash
-sudo logrotate -f /etc/logrotate.d/alphaforge
-```
-
-## CloudWatch Agent
-
-CloudWatch Agent 本项目不自动安装，因为它需要 AWS 侧的 IAM role、CloudWatch Logs 权限和
-账号级配置。建议在 AWS 上采集：
-
-```text
-EC2 CPU、内存、磁盘使用率
-/var/log/alphaforge/service.log
-/var/log/alphaforge/trade.jsonl
-/var/log/alphaforge/audit.jsonl
-```
-
-参考 AWS 官方文档：
-
-- [Install CloudWatch Agent](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/install-CloudWatch-Agent-on-EC2-Instance.html)
-- [CloudWatch Agent configuration file](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Agent-Configuration-File-Details.html)
-- [CloudWatch Logs getting started](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_GettingStarted.html)
+---
 
 ## grid_v1 策略
 
-`/etc/alphaforge/config.yaml` 保存 IBKR、路径、风控等通用配置。`/etc/alphaforge/grid.yaml`
-保存网格策略参数和可变状态，包含每个标的的 `base_price`、涨跌幅、单次交易金额、
-当前状态和活跃订单。
-`grid.yaml` 由 `alphaforge` 服务用户写入，`env` 和 `config.yaml` 仍由 root 管理。
+**声明 vs 运行态**：你在 `config/grid.yaml`（spec）为每个标的声明 `base_price`、涨跌幅、单次交易金额、`paused`；引擎把演化后的 `base_price`、活跃订单、状态写到 `state/grid_state.json`（status）。
 
-`grid_v1` 的用户可见状态只有两种：
+`base_price` 有双重身份：你设的是**初始锚点**，引擎成交后会**自适应演化**。引擎记住「上次见到的 spec 锚点」——
 
-```text
+- 你**没改** spec 的 `base_price` → 沿用引擎演化后的值；
+- 你**改了** spec 的 `base_price`（`afctl edit`）→ 视为**手动重锚**，你的值立即覆盖演化值。
+
+`paused: true` 是你的手动开关。引擎在订单被拒时也会**自动熔断**该标的（记在 status 的 `halted`），用 `sudo ./afctl resume [标的]` 解除。
+
+> **恢复被引擎暂停的标的**：`resume` 直接改写 `state/grid_state.json`。当该标的处于空闲（无订单事件）时立即可靠生效；但若**其它标的正在频繁成交**，引擎可能在下一次存盘时重新写回 `halted` 把它盖掉。要确保生效，请在该标的安静时执行 `resume`，或 `sudo ./afctl restart` 重启引擎（重启必然从 status 重新读取）。
+
+用户可见状态只有两种：
+
+```
 WAITING_TRIGGER  没有活跃订单，等待价格触发买入或卖出。
-WAITING_TRADE    已经触发并提交订单，等待 IBKR 成交、取消或过期事件。
+WAITING_TRADE    已触发并提交订单，等待 IBKR 成交、取消或过期事件。
 ```
 
-触发规则：
+触发规则（留 1% 容差先触发再挂单）：
 
-```text
+```
 卖出触发：latest_price >= base_price * (1 + up_pct * 0.99)
 买入触发：latest_price <= base_price * (1 - down_pct * 0.99)
 ```
 
-挂单仍使用完整网格价：
+挂单用完整网格价：
 
-```text
+```
 卖出限价：base_price * (1 + up_pct)
 买入限价：base_price * (1 - down_pct)
-数量：floor(trade_amount / limit_price)
+数量：    floor(trade_amount / limit_price)
 ```
 
-订单使用 `GTD`，有效期 7 个自然日，并允许盘前盘后成交。挂单等待期间，如果价格回到
-下单时的 `base_price`，程序会主动撤单。撤单完成后，`base_price` 根据最终成交比例自适应调整：
+订单用 `GTD`、有效期 7 个自然日、允许盘前盘后成交。挂单等待期间，如果价格回到下单时的 `base_price`，引擎会主动撤单。撤单/成交后 `base_price` 按成交比例自适应：
 
-```text
+```
 new_base_price = old_base_price + fill_ratio * (limit_price - old_base_price)
 ```
 
-零成交时 `base_price` 不变；部分成交时向挂单价移动一部分；全部成交时更新为挂单价。
-手动修改 `/etc/alphaforge/grid.yaml` 前建议先停止服务。
+零成交不变；部分成交向挂单价移动一部分；全部成交更新为挂单价。
 
-## 命令
+---
+
+## 日志与状态观测
+
+重构后日志只在两个地方，不用再记 `/var/log`：
 
 ```bash
-/opt/alphaforge/venv/bin/alphaforge doctor
-/opt/alphaforge/venv/bin/alphaforge run
-/opt/alphaforge/venv/bin/alphaforge kill --on
-/opt/alphaforge/venv/bin/alphaforge kill --off
-/opt/alphaforge/venv/bin/alphaforge kill --status
+./afctl logs trade      # logs/trade.jsonl —— 交易关键事件（连接/reconcile/触发/成交/撤单/风控）
+./afctl logs audit      # logs/audit.jsonl —— 交易事件 + 采样常规事件（默认 1% 采样）
+./afctl logs engine     # 引擎容器 stdout/stderr —— 异常堆栈、底层库提示
+./afctl logs gateway    # IB Gateway 容器日志 —— 登录与会话状态
 ```
+
+健康判断（`./afctl status` 一屏看全）：
+
+```
+ib-gateway / alphaforge-engine 都是 running（compose ps 显示 healthy）
+引擎心跳 ✓ 活着（距上次心跳 < 60s）—— 容器 running 但心跳过期 = 引擎卡住/重连中
+4001/4002 在监听
+trade.jsonl 出现 connected、reconcile_completed、portfolio_loaded、quote_stream_starting
+audit.jsonl 持续出现 quote_no_trigger / outside_trading_window 等行情事件
+grid_state.json 里 state 与 active_order 关系合理（WAITING_TRIGGER↔无单，WAITING_TRADE↔有单）
+```
+
+引擎每 ~15s 写一次 `state/heartbeat.json`（计时驱动，行情清淡也不会过期），记录会话阶段、是否已连接、距上次行情多久——`./afctl status` 直接展示，容器 `healthcheck` 也据此判 healthy。心跳是「进程/事件循环还活着」的信号，与「行情是否在流动」分开看（后者是 `last_quote_age`）。
+
+`trade.jsonl` 出现 `engine_session_retrying` 表示进程仍在、但当前 IBKR 会话不可用，正在退避重连，恢复前不会下单（此时心跳阶段为 `retrying`）。
+
+> 注意：Paper 常驻期间，尽量别用同一个 IBKR 用户在手机端重新登录/切换会话，否则可能干扰 Gateway 会话导致查询超时。更稳的做法是给 AWS Gateway 用专门的量化登录用户。
+
+### 主动告警（Server酱 → 微信，可选）
+
+原理：告警通过 [Server酱](https://sct.ftqq.com) 推到你的微信——你只需一个 `SendKey`。
+
+1. 微信扫码登录 https://sct.ftqq.com ，复制页面上的 **SendKey**（形如 `SCTxxxxxxxx`）。
+2. 关注它提示的服务号（这样消息才能进你微信）。
+3. 在 `config/env` 填上（留空则全程静默）：
+   ```
+   SERVERCHAN_SENDKEY=SCTxxxxxxxx
+   ```
+4. 验证与生效：
+   ```bash
+   sudo ./afctl alert-test      # 立即发一条到微信，验证连通（一次性容器，现读现发）
+   sudo ./afctl restart         # 让常驻 engine + watchdog 用上新 SendKey
+   ./afctl logs watchdog        # 查看看门狗
+   ```
+
+两层覆盖：
+
+- **引擎内告警**：关键事件实时推送——`engine_session_failed`（崩溃）、`order_rejected`（拒单熔断）、`grid_spec_reload_failed`（热加载失败）。低频高价值，刻意不含噪声事件（如 `risk_rejected`、重连中）。
+- **看门狗容器**：独立进程盯 `heartbeat.json`，心跳超过 120s 未更新就告警——**引擎进程死了也能通知你**（死进程无法自报）。只在「健康↔异常」切换时各推一次，不会每分钟刷屏。
+
+> 局限：若整台 AWS 实例宕机，两者都发不出告警（需外部探活，如 CloudWatch / UptimeRobot）。
+
+---
+
+## 更新与回滚
+
+```bash
+sudo ./afctl update
+```
+
+它会依次：`git pull --ff-only` → `docker compose build engine` → **跑验收单测** → 测试通过才 `compose up -d`。测试不过会中止且**保持原服务不动**，已跑通的交易链路不会被改坏。
+
+回滚到上一个版本：
+
+```bash
+git -C . log --oneline -5     # 找到要回退的 commit
+git checkout <commit>
+sudo ./afctl up               # 重建并重启
+```
+
+---
+
+## 故障排查
+
+| 现象 | 排查 |
+|---|---|
+| 引擎连不上 IBKR | `./afctl logs gateway` 确认已登录；`./afctl status` 看 4001/4002 是否监听 |
+| 手机登录后查询超时 | `sudo ./afctl restart`；常驻期间避免手机端重复登录同一用户 |
+| 改了 grid.yaml 没生效 | 引擎数秒内热加载；用 `sudo ./afctl edit` 改可顺带校验。若校验失败会沿用旧配置 |
+| 某标的不再交易了 | 可能被引擎熔断（下单被拒）；`./afctl grid` 看 `halted`，`sudo ./afctl resume <标的>` 解除 |
+| 想紧急止损 | `sudo ./afctl kill on`（约 1 秒生效，不再下单；撤单/状态仍正常）|
+| 容器起不来 | `./afctl logs engine` / `./afctl logs gateway` 看最近日志 |
+
+---
+
+## 已知限制
+
+当前设计下的边界，了解后可避免踩坑（多数有简单规避手段）：
+
+1. **行情订阅集合在启动时固定**。引擎启动时一次性订阅 `grid.yaml` 里所有未 `paused` 标的的行情；运行期间热加载只更新**已订阅标的**的参数（涨跌幅、`base_price` 等）。因此**新增标的、或恢复启动时即 `paused` 的标的，需 `sudo ./afctl restart` 才会开始报价**；改已有标的的参数则无需重启。
+
+2. **`resume` 在多标的并发成交时可能被覆盖**。它从引擎外改写 `grid_state.json`，若恰好其它标的正在频繁成交，引擎下一次存盘可能盖回 `halted`。规避：在该标的安静时执行，或 `sudo ./afctl restart`（详见上文策略章节的警示框）。彻底解法（resume 走引擎控制通道）已记在 `clear_halt` 注释里，待真正用到多标的时再实现。
+
+3. **手动清空 `state/grid_state.json` 时，同步删掉 `grid.yaml` 里的遗留运行态字段**。首次迁移时引擎会容忍 spec 里残留的 `state:`/`active_order:` 并据此 seed 状态；若日后手删了状态文件却把这些字段留在 spec 里，可能复活一个 IBKR 已不存在的幽灵订单（无事件可结算 → 卡在 `WAITING_TRADE`）。迁移成功后请清掉 spec 里的运行态字段。
+
+4. **`afctl edit` 的语法校验依赖 IB 凭证已填**。校验会完整加载配置（含凭证检查），凭证为空时即使 grid 本身没问题也会报校验失败；正常部署后凭证已填，不受影响。
+
+5. **（待实例确认）`compose run` 与固定 `container_name`**。`validate`/`resume`/`doctor` 用 `docker compose run` 起一次性容器执行，视 compose 版本可能与运行中的 `alphaforge-engine` 重名冲突。在实例上 `sudo ./afctl up` 后跑 `sudo ./afctl doctor`：若报 `container name ... already in use`，需把这三条改用 `compose exec`。
+
+---
 
 ## 本地测试
 
+无需 Docker，纯逻辑单测（策略/订单/风控/配置）：
+
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
+python3 -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
 pytest
+```
+
+或在容器里跑（与 `afctl update` 用的同一套验收）：`./afctl test`。
+
+---
+
+## 目录结构
+
+```
+AlphaForge/
+  afctl                  唯一控制入口
+  start.sh               一键部署（幂等）
+  docker-compose.yml     ib-gateway + engine
+  Dockerfile             引擎镜像
+  config/
+    env(.example)        IB 凭证（真文件 gitignore）
+    config.yaml          端口/路径/风控
+    grid(.example).yaml  策略声明 spec（真文件 gitignore）
+  state/
+    grid_state.json      运行态 status：演化 base_price/订单/状态（引擎写）
+    heartbeat.json       引擎心跳 liveness（每 ~15s 覆盖写；healthcheck/status 读取）
+    kill-switch          紧急停下单标志；grid.yaml.bak.* 编辑备份
+  logs/                  trade.jsonl、audit.jsonl（运行时，引擎内按 50MiB×5 自动轮转）
+  scripts/               lib.sh（公共函数）、bootstrap.sh（装 Docker）
+  src/alphaforge/        引擎代码：core / strategies / adapters / execution / state / logging
+  tests/                 验收单测
 ```

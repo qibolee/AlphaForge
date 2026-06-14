@@ -1,3 +1,4 @@
+# Python
 .DS_Store
 .venv/
 __pycache__/
@@ -11,10 +12,15 @@ dist/
 .coverage
 htmlcov/
 
-# Real secrets live in /etc/alphaforge/env on AWS.
-*.local
-*.secret
+# 本机密钥与运行时状态 —— 绝不提交到 GitHub
+config/env
+config/grid.yaml
+config/*.bak.*
+state/*
+!state/.gitkeep
+logs/*
+!logs/.gitkeep
+*.bak
 
-# Runtime artifacts live under /var/log/alphaforge and /var/lib/alphaforge.
-*.jsonl
-*.log
+# 本地工具配置
+.claude/

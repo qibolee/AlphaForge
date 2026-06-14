@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from datetime import datetime, timezone
+from pathlib import Path
 
-from alphaforge.core.config import Settings, load_settings
+from alphaforge.alerts import Notifier
+from alphaforge.core.config import ConfigError, Settings, load_settings
 from alphaforge.logging.event_log import EventLogger
 from alphaforge.state.grid_store import GridStateStore
+from alphaforge.state.heartbeat import (
+    HEARTBEAT_INTERVAL_SECONDS,
+    LivenessState,
+    write_heartbeat,
+)
 from alphaforge.adapters.ibkr import IBKRClient
 from alphaforge.core.models import GridRuntimeConfig
 from alphaforge.core.models import GridState, Portfolio, Quote
@@ -18,11 +27,12 @@ SESSION_RETRY_MAX_SECONDS = 300
 
 
 class TradingEngine:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, liveness: LivenessState | None = None) -> None:
         self.settings = settings
         self.client = IBKRClient(settings)
-        self.state_store = GridStateStore(settings.paths.grid_config)
+        self.state_store = GridStateStore(settings.paths.grid_config, settings.paths.grid_state)
         self.risk = RiskManager(settings.risk, settings.paths.kill_switch)
+        self.liveness = liveness or LivenessState()
 
     async def run(self) -> None:
         self.settings.paths.log_dir.mkdir(parents=True, exist_ok=True)
@@ -35,6 +45,7 @@ class TradingEngine:
             self.settings.env.mode.value,
             self.settings.env.account,
             grid_config.audit_log_sample_rate,
+            notifier=Notifier.from_settings(self.settings),
         )
         strategy = GridStrategy(grid_config.trading_window)
         order_manager = OrderManager(
@@ -47,6 +58,9 @@ class TradingEngine:
         )
 
         await self.client.connect()
+        self.liveness.connected = True
+        self.liveness.symbols = grid_config.symbols
+        self.liveness.session_phase = "running"
         logger.trade(
             "connected",
             "_system",
@@ -67,9 +81,24 @@ class TradingEngine:
                 positions=list(portfolio.positions),
             )
             logger.trade("quote_stream_starting", "_system", symbols=grid_config.symbols)
+            reload_failing = False
             async for quote in self.client.stream_quotes(grid_config.symbols):
+                self.liveness.last_quote_at = datetime.now(timezone.utc)
                 await order_manager.drain_order_events(grid_config)
-                grid_config = self.state_store.load()
+                try:
+                    grid_config = self.state_store.load()
+                    if reload_failing:
+                        reload_failing = False
+                        logger.trade("grid_spec_reload_recovered", "_system")
+                except ConfigError as exc:
+                    # A live spec edit (afctl edit) introduced an error. Keep the last-good
+                    # config so a typo cannot crash the trading loop; the next valid save
+                    # of grid.yaml is picked up automatically. Log once on the good->bad
+                    # transition at trade level — sampled regular() would hide it, and
+                    # logging every loop iteration (~1/s) would spam the log.
+                    if not reload_failing:
+                        reload_failing = True
+                        logger.trade("grid_spec_reload_failed", "_system", error=str(exc))
                 try:
                     portfolio = await self._load_portfolio(logger)
                 except TimeoutError:
@@ -83,6 +112,7 @@ class TradingEngine:
                     logger,
                 )
         finally:
+            self.liveness.connected = False
             self.client.disconnect()
             logger.trade("disconnected", "_system")
 
@@ -135,51 +165,80 @@ class TradingEngine:
 
 
 async def run_forever() -> None:
-    retry_attempt = 0
-    while True:
-        settings = load_settings()
-        logger = _system_logger(settings)
-        try:
-            await TradingEngine(settings).run()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            if not _is_recoverable_session_error(exc):
+    boot_settings = load_settings()
+    liveness = LivenessState()
+    # Timer-driven heartbeat runs alongside (and outlives) each trading session,
+    # so liveness keeps beating through reconnect backoffs and quiet markets.
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(boot_settings.paths.heartbeat, liveness))
+    try:
+        retry_attempt = 0
+        while True:
+            settings = load_settings()
+            logger = _system_logger(settings)
+            liveness.session_phase = "starting"
+            liveness.connected = False
+            try:
+                await TradingEngine(settings, liveness).run()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                liveness.connected = False
+                if not _is_recoverable_session_error(exc):
+                    liveness.session_phase = "failed"
+                    logger.trade(
+                        "engine_session_failed",
+                        "_system",
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        recoverable=False,
+                    )
+                    raise
+
+                retry_attempt += 1
+                delay_seconds = _retry_delay_seconds(retry_attempt)
+                liveness.session_phase = "retrying"
+                liveness.retry_attempt = retry_attempt
                 logger.trade(
-                    "engine_session_failed",
+                    "engine_session_retrying",
                     "_system",
                     error_type=type(exc).__name__,
                     error=str(exc),
-                    recoverable=False,
+                    retry_attempt=retry_attempt,
+                    delay_seconds=delay_seconds,
                 )
-                raise
+                await asyncio.sleep(delay_seconds)
+                continue
 
             retry_attempt += 1
             delay_seconds = _retry_delay_seconds(retry_attempt)
+            liveness.session_phase = "ended"
+            liveness.retry_attempt = retry_attempt
             logger.trade(
-                "engine_session_retrying",
+                "engine_session_ended",
                 "_system",
-                error_type=type(exc).__name__,
-                error=str(exc),
                 retry_attempt=retry_attempt,
                 delay_seconds=delay_seconds,
             )
             await asyncio.sleep(delay_seconds)
-            continue
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
 
-        retry_attempt += 1
-        delay_seconds = _retry_delay_seconds(retry_attempt)
-        logger.trade(
-            "engine_session_ended",
-            "_system",
-            retry_attempt=retry_attempt,
-            delay_seconds=delay_seconds,
-        )
-        await asyncio.sleep(delay_seconds)
+
+async def _heartbeat_loop(path: Path, liveness: LivenessState) -> None:
+    while True:
+        try:
+            write_heartbeat(path, liveness)
+        except Exception:
+            # Liveness is best-effort: a failed write must never crash trading.
+            # Its absence is itself the signal (healthz goes stale -> unhealthy).
+            pass
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
 def _system_logger(settings: Settings) -> EventLogger:
-    grid_config = GridStateStore(settings.paths.grid_config).load()
+    grid_config = GridStateStore(settings.paths.grid_config, settings.paths.grid_state).load()
     return EventLogger(
         settings.paths.audit_log,
         settings.paths.trade_log,
@@ -187,6 +246,7 @@ def _system_logger(settings: Settings) -> EventLogger:
         settings.env.mode.value,
         settings.env.account,
         grid_config.audit_log_sample_rate,
+        notifier=Notifier.from_settings(settings),
     )
 
 

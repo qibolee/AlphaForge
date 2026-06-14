@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -8,8 +9,10 @@ import yaml
 
 from alphaforge.core.models import Mode
 
-DEFAULT_ENV_PATH = Path("/etc/alphaforge/env")
-DEFAULT_CONFIG_PATH = Path("/etc/alphaforge/config.yaml")
+# Paths are project-local: ./config is mounted into the engine container at /app/config.
+# Both are overridable via env vars so local dev and tests can point elsewhere.
+DEFAULT_ENV_PATH = Path(os.environ.get("ALPHAFORGE_ENV", "/app/config/env"))
+DEFAULT_CONFIG_PATH = Path(os.environ.get("ALPHAFORGE_CONFIG", "/app/config/config.yaml"))
 
 
 class ConfigError(ValueError):
@@ -23,6 +26,7 @@ class EnvConfig:
     mode: Mode
     account: str
     live_trading_enabled: bool
+    serverchan_sendkey: str = ""  # optional: empty -> alerts disabled (Server酱 -> 微信)
 
 
 @dataclass(frozen=True)
@@ -43,8 +47,10 @@ class PathsConfig:
     state_dir: Path
     audit_log: Path
     trade_log: Path
-    grid_config: Path
+    grid_config: Path  # spec: user-owned strategy params (engine reads, never writes)
+    grid_state: Path  # status: engine-owned runtime (evolved base_price, orders, state)
     kill_switch: Path
+    heartbeat: Path  # status: engine liveness beat (healthcheck + afctl status)
 
 
 @dataclass(frozen=True)
@@ -75,11 +81,11 @@ class Settings:
 
     def validate_for_run(self) -> None:
         if not self.env.username:
-            raise ConfigError("IB_USERNAME is required in /etc/alphaforge/env")
+            raise ConfigError("IB_USERNAME is required in config/env")
         if not self.env.password:
-            raise ConfigError("IB_PASSWORD is required in /etc/alphaforge/env")
+            raise ConfigError("IB_PASSWORD is required in config/env")
         if not self.env.account:
-            raise ConfigError("IB_ACCOUNT is required in /etc/alphaforge/env")
+            raise ConfigError("IB_ACCOUNT is required in config/env")
         if self.env.mode == Mode.LIVE and not self.env.live_trading_enabled:
             raise ConfigError("IB_MODE=live requires LIVE_TRADING_ENABLED=true")
         if self.strategy.name != "grid_v1":
@@ -113,6 +119,7 @@ def load_settings(
             mode=mode,
             account=env_raw.get("IB_ACCOUNT", ""),
             live_trading_enabled=_bool(env_raw.get("LIVE_TRADING_ENABLED", "false")),
+            serverchan_sendkey=env_raw.get("SERVERCHAN_SENDKEY", "").strip(),
         ),
         ibkr=IbkrConfig(
             host=str(ibkr_raw.get("host", "127.0.0.1")),
@@ -122,12 +129,14 @@ def load_settings(
             market_data_type=int(ibkr_raw.get("market_data_type", 3)),
         ),
         paths=PathsConfig(
-            log_dir=Path(paths_raw.get("log_dir", "/var/log/alphaforge")),
-            state_dir=Path(paths_raw.get("state_dir", "/var/lib/alphaforge")),
-            audit_log=Path(paths_raw.get("audit_log", "/var/log/alphaforge/audit.jsonl")),
-            trade_log=Path(paths_raw.get("trade_log", "/var/log/alphaforge/trade.jsonl")),
-            grid_config=Path(paths_raw.get("grid_config", "/etc/alphaforge/grid.yaml")),
-            kill_switch=Path(paths_raw.get("kill_switch", "/var/lib/alphaforge/kill-switch")),
+            log_dir=Path(paths_raw.get("log_dir", "/app/logs")),
+            state_dir=Path(paths_raw.get("state_dir", "/app/state")),
+            audit_log=Path(paths_raw.get("audit_log", "/app/logs/audit.jsonl")),
+            trade_log=Path(paths_raw.get("trade_log", "/app/logs/trade.jsonl")),
+            grid_config=Path(paths_raw.get("grid_config", "/app/config/grid.yaml")),
+            grid_state=Path(paths_raw.get("grid_state", "/app/state/grid_state.json")),
+            kill_switch=Path(paths_raw.get("kill_switch", "/app/state/kill-switch")),
+            heartbeat=Path(paths_raw.get("heartbeat", "/app/state/heartbeat.json")),
         ),
         strategy=StrategyConfig(
             name=str(strategy_raw.get("name", "grid_v1")),

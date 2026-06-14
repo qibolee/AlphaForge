@@ -1,0 +1,20 @@
+# 网格策略「声明」(spec) —— 你编辑这里，引擎只读、绝不写回。
+# 可在引擎运行时直接用 ./afctl edit 修改，无需停服务（下一轮轮询自动热加载）。
+# 运行态（演化后的 base_price / 活跃订单 / 状态）由引擎写到 state/grid_state.json，勿手改。
+# start.sh 首次会把本模板复制为 config/grid.yaml。
+strategy_name: grid_v1
+audit_log_sample_rate: 0.01
+
+trading_window:
+  timezone: America/New_York
+  start: "04:00"
+  end: "20:00"
+  outside_rth: true
+
+grids:
+  - symbol: TSLA
+    base_price: 400.00     # 初始锚点；运行后引擎自适应演化。改这个值 = 手动重锚(reanchor)
+    up_pct: 0.30
+    down_pct: 0.25
+    trade_amount: 1000
+    paused: false          # 你的手动开关：true = 该标的不参与交易

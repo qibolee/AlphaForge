@@ -1,0 +1,17 @@
+# 构建上下文排除：密钥、运行时产物、本地缓存。
+.git
+.gitignore
+config
+state
+logs
+*.bak
+__pycache__/
+*.py[cod]
+.venv
+.pytest_cache
+.ruff_cache
+*.egg-info
+build/
+dist/
+files/
+install.sh

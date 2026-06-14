@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# ============================================================
+#  AlphaForge 管理 CLI
+#  用法: sudo ./afctl <命令> [参数]
+# ============================================================
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/scripts/lib.sh"   # 提供 log/info/warn/die/compose/load_env 等
+
+IMAGE="alphaforge-engine:local"
+KILL_SWITCH="$ROOT_DIR/state/kill-switch"
+
+usage() {
+  cat <<'EOF'
+AlphaForge 管理命令：
+  sudo ./afctl up               构建并启动（gateway + engine）
+  sudo ./afctl stop             停止容器（保留，不删除）
+  sudo ./afctl restart          重启容器
+  sudo ./afctl down             停止并移除容器
+  ./afctl status                服务/容器/端口/网格 一屏看全
+  ./afctl logs [engine|gateway|watchdog|trade|audit]   查看日志（默认 engine）
+  ./afctl grid                  查看策略声明(spec) + 运行态(status)
+  sudo ./afctl edit             改策略声明 grid.yaml（引擎热加载，无需停服务）
+  sudo ./afctl resume [标的]    解除引擎对某标的的熔断（下单被拒后会自动暂停）
+  sudo ./afctl kill on|off|status             紧急停止/恢复下单
+  ./afctl doctor                引擎自检（配置/路径/IBKR 端口）
+  ./afctl alert-test            发送一条微信测试告警（验证渠道连通）
+  ./afctl test                  运行验收单测（paper 安全网）
+  sudo ./afctl update           git pull → 重建 → 跑测试 → 重启
+EOF
+}
+
+require_env() {
+  load_env
+  local k
+  for k in IB_USERNAME IB_PASSWORD IB_ACCOUNT; do
+    [[ -n "${!k:-}" ]] || die "config/env 中 $k 为空，请填写后重试。"
+  done
+}
+
+container_state() { docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null || echo missing; }
+
+cmd_status() {
+  compose ps 2>/dev/null || true
+  echo
+  info "容器状态："
+  printf "  %-20s %s\n" "ib-gateway"          "$(container_state ib-gateway)"
+  printf "  %-20s %s\n" "alphaforge-engine"   "$(container_state alphaforge-engine)"
+  printf "  %-20s %s\n" "alphaforge-watchdog" "$(container_state alphaforge-watchdog)"
+  echo
+  info "引擎心跳（state/heartbeat.json）："
+  if [[ -f "$ROOT_DIR/state/heartbeat.json" ]]; then
+    python3 - "$ROOT_DIR/state/heartbeat.json" <<'PY' 2>/dev/null || echo "  (无法解析心跳文件)"
+import json, sys
+from datetime import datetime, timezone
+d = json.load(open(sys.argv[1]))
+age = (datetime.now(timezone.utc) - datetime.fromisoformat(d["ts"])).total_seconds()
+mark = "✓ 活着" if age < 60 else "⚠ 心跳过期（引擎可能卡住/重连中）"
+lq = d.get("last_quote_age_seconds")
+lq_s = f"{lq:.0f}s 前" if isinstance(lq, (int, float)) else "—"
+print(f"  {mark}  距上次心跳 {age:.0f}s  阶段={d.get('session_phase')}  "
+      f"已连接={d.get('connected')}  距上次行情={lq_s}")
+PY
+  else
+    echo "  (引擎尚未写心跳；启动后约 15s 生成)"
+  fi
+  echo
+  info "IBKR 端口监听（4001/4002）："
+  ss -tlnp 2>/dev/null | grep -E ':400[12]\b' | sed 's/^/  /' || echo "  (4001/4002 未监听)"
+  echo
+  info "网格声明 spec（config/grid.yaml）："
+  if [[ -f "$ROOT_DIR/config/grid.yaml" ]]; then
+    grep -E '^\s*(- symbol|symbol|base_price|up_pct|down_pct|trade_amount|paused):' \
+      "$ROOT_DIR/config/grid.yaml" | sed 's/^/  /'
+  else
+    echo "  (config/grid.yaml 不存在，运行 sudo ./start.sh)"
+  fi
+  if [[ -f "$ROOT_DIR/state/grid_state.json" ]]; then
+    info "运行态 status（引擎演化值）："
+    python3 - "$ROOT_DIR/state/grid_state.json" <<'PY' 2>/dev/null || true
+import json, sys
+for s, v in json.load(open(sys.argv[1])).get("symbols", {}).items():
+    print(f"  {s}: base={v.get('base_price')} state={v.get('state')} "
+          f"halted={v.get('halted')} active={'yes' if v.get('active_order') else 'no'}")
+PY
+  fi
+  [[ -f "$KILL_SWITCH" ]] && { echo; warn "KILL SWITCH 已启用：引擎不会下单（撤单/状态仍正常）。"; }
+}
+
+cmd_logs() {
+  case "${1:-engine}" in
+    engine)             compose logs -f --tail=100 engine ;;
+    gateway|ib-gateway) compose logs -f --tail=100 ib-gateway ;;
+    watchdog)           compose logs -f --tail=100 watchdog ;;
+    trade)              tail -f "$ROOT_DIR/logs/trade.jsonl" ;;
+    audit)              tail -f "$ROOT_DIR/logs/audit.jsonl" ;;
+    *) die "用法: ./afctl logs [engine|gateway|watchdog|trade|audit]" ;;
+  esac
+}
+
+cmd_grid() {
+  info "策略声明 spec（config/grid.yaml，你编辑）："
+  if [[ -f "$ROOT_DIR/config/grid.yaml" ]]; then
+    sed 's/^/  /' "$ROOT_DIR/config/grid.yaml"
+  else
+    echo "  (不存在，请先 sudo ./start.sh)"
+  fi
+  echo
+  info "运行态 status（state/grid_state.json，引擎写）："
+  if [[ -f "$ROOT_DIR/state/grid_state.json" ]]; then
+    { python3 -m json.tool "$ROOT_DIR/state/grid_state.json" 2>/dev/null \
+      || cat "$ROOT_DIR/state/grid_state.json"; } | sed 's/^/  /'
+  else
+    echo "  (引擎首次保存后生成)"
+  fi
+}
+
+# 引擎从不写 grid.yaml，所以可热改：编辑后引擎下一轮自动加载，无需停服务。
+cmd_edit() {
+  need_root ./afctl edit
+  local f="$ROOT_DIR/config/grid.yaml"
+  [[ -f "$f" ]] || die "找不到 $f，请先 sudo ./start.sh"
+  mkdir -p "$ROOT_DIR/state"
+  local bak="$ROOT_DIR/state/grid.yaml.bak.$(date +%F-%H%M%S)"
+  cp "$f" "$bak"
+  "${EDITOR:-vim}" "$f"
+  info "校验 grid.yaml..."
+  if compose run --rm --no-deps engine alphaforge validate >/dev/null 2>&1; then
+    log "校验通过。引擎会在下一轮轮询（数秒内）自动热加载，无需重启。"
+  else
+    warn "校验未通过：grid.yaml 可能有误。引擎仍用上一份有效配置运行（不会崩）。"
+    warn "已备份原文件：$bak"
+    warn "修正后再跑 ./afctl grid 确认，或恢复：cp '$bak' '$f'"
+  fi
+}
+
+cmd_resume() {
+  need_root ./afctl resume
+  if [[ -n "${1:-}" ]]; then
+    compose run --rm --no-deps engine alphaforge resume --symbol "$1"
+  else
+    compose run --rm --no-deps engine alphaforge resume
+  fi
+}
+
+cmd_kill() {
+  case "${1:-status}" in
+    on)  need_root ./afctl kill on; mkdir -p "$ROOT_DIR/state"; echo manual > "$KILL_SWITCH"
+         warn "kill switch ON：引擎不会再下单（约 1 秒内生效）。" ;;
+    off) need_root ./afctl kill off; rm -f "$KILL_SWITCH"; log "kill switch OFF。" ;;
+    status) [[ -f "$KILL_SWITCH" ]] && echo "kill_switch=on ($KILL_SWITCH)" || echo "kill_switch=off" ;;
+    *) die "用法: ./afctl kill [on|off|status]" ;;
+  esac
+}
+
+cmd_test() {
+  log "构建引擎镜像..."
+  compose build engine
+  log "运行验收单测..."
+  docker run --rm --entrypoint python "$IMAGE" -m pytest
+}
+
+cmd_update() {
+  need_root ./afctl update
+  log "拉取最新代码..."
+  git -C "$ROOT_DIR" pull --ff-only
+  log "重建引擎镜像..."
+  compose build engine
+  log "运行验收单测（paper 安全网）..."
+  docker run --rm --entrypoint python "$IMAGE" -m pytest \
+    || die "测试未通过，已中止更新；交易服务保持原状未重启。"
+  log "更新 gateway 镜像并重启..."
+  compose pull ib-gateway || true
+  compose up -d
+  log "更新完成。用 ./afctl status 确认。"
+}
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  up|start)   need_root ./afctl up; require_env; mkdir -p "$ROOT_DIR/state" "$ROOT_DIR/logs"; compose up -d --build ;;
+  stop)       need_root ./afctl stop; compose stop ;;
+  restart)    need_root ./afctl restart; compose restart ;;
+  down)       need_root ./afctl down; compose down ;;
+  status)     cmd_status ;;
+  logs)       cmd_logs "$@" ;;
+  grid)       cmd_grid ;;
+  edit)       cmd_edit ;;
+  resume)     cmd_resume "$@" ;;
+  kill)       cmd_kill "$@" ;;
+  doctor)     compose run --rm --no-deps engine alphaforge doctor ;;
+  alert-test) compose run --rm --no-deps engine alphaforge alert-test ;;
+  test)       cmd_test ;;
+  update)     cmd_update ;;
+  help|-h|--help) usage ;;
+  *) warn "未知命令: $cmd"; echo; usage; exit 1 ;;
+esac

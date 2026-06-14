@@ -165,7 +165,7 @@ def _manager(tmp: Path, filled_quantity: float) -> tuple[GridRuntimeConfig, Orde
             )
         ],
     )
-    store = GridStateStore(tmp / "grid.yaml")
+    store = GridStateStore(tmp / "grid.yaml", tmp / "grid_state.json")
     logger = EventLogger(
         tmp / "audit.jsonl",
         tmp / "trade.jsonl",
@@ -212,7 +212,27 @@ def _submit_manager(
             )
         ],
     )
-    store = GridStateStore(tmp / "grid.yaml")
+    # submit_trigger persists state and reloads it (place_limit_order reads it back),
+    # so the spec must exist on disk for the spec/status reconciliation to run.
+    (tmp / "grid.yaml").write_text(
+        """
+strategy_name: grid_v1
+audit_log_sample_rate: 1
+trading_window:
+  timezone: America/New_York
+  start: "04:00"
+  end: "20:00"
+  outside_rth: true
+grids:
+  - symbol: TSLA
+    base_price: 250.0
+    up_pct: 0.05
+    down_pct: 0.05
+    trade_amount: 1000
+    paused: false
+"""
+    )
+    store = GridStateStore(tmp / "grid.yaml", tmp / "grid_state.json")
     logger = EventLogger(
         tmp / "audit.jsonl",
         tmp / "trade.jsonl",

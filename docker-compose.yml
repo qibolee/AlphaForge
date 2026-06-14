@@ -1,0 +1,73 @@
+services:
+  # IB Gateway：用账号密钥自动登录（IBC），对外发布本地端口 4001/4002。
+  # 保持与原项目完全一致的端口映射，交易连接路径不变。
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:stable
+    container_name: ib-gateway
+    restart: always
+    environment:
+      - TWS_USERID=${IB_USERNAME}
+      - TWS_PASSWORD=${IB_PASSWORD}
+      - TRADING_MODE=${IB_MODE}
+      - AUTO_RESTART_TIME=${AUTO_RESTART_TIME}
+    ports:
+      # Docker 格式：host_ip:host_port:container_port
+      # paper: Python 连 host 4002（镜像 paper relay 是 container 4004）
+      - "127.0.0.1:4002:4004"
+      # live:  Python 连 host 4001（镜像 live relay 是 container 4003）
+      - "127.0.0.1:4001:4003"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # 交易引擎：本仓库代码打成镜像。
+  # network_mode: host → 仍以 127.0.0.1:4002 连 Gateway，与原 host venv 行为一致。
+  # 凭证/配置/状态/日志全部通过卷挂载，容器内只读 /app/config/env，密钥不进镜像。
+  engine:
+    build: .
+    image: alphaforge-engine:local
+    container_name: alphaforge-engine
+    restart: always
+    network_mode: host
+    environment:
+      - ALPHAFORGE_ENV=/app/config/env
+      - ALPHAFORGE_CONFIG=/app/config/config.yaml
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+    volumes:
+      - ./config:/app/config
+      - ./state:/app/state
+      - ./logs:/app/logs
+    depends_on:
+      - ib-gateway
+    healthcheck:
+      # 心跳新鲜则健康（引擎每 ~15s 写一次 state/heartbeat.json）。
+      # 仅用于可观测（compose ps 显示 healthy/unhealthy）；restart:always 只在退出时重启。
+      test: ["CMD", "alphaforge", "healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  # 看门狗：独立容器，只盯 state/heartbeat.json 的新鲜度并经 Server酱推微信告警。
+  # 引擎容器挂了它仍存活（监视的是文件而非进程）——一个死进程无法自报死亡。
+  # 复用引擎镜像，只换命令；不需要 host 网络（仅出站 HTTPS 到 Server酱）。
+  watchdog:
+    build: .
+    image: alphaforge-engine:local
+    container_name: alphaforge-watchdog
+    restart: always
+    command: ["alphaforge", "watchdog"]
+    environment:
+      - ALPHAFORGE_ENV=/app/config/env
+      - ALPHAFORGE_CONFIG=/app/config/config.yaml
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./config:/app/config
+      - ./state:/app/state
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import json
 import shutil
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,47 +18,189 @@ from alphaforge.core.models import (
     TradingWindow,
 )
 
+STATE_VERSION = 1
+
 
 class GridStateStore:
-    def __init__(self, path: Path) -> None:
-        self.path = path
+    """Spec/Status split for the grid.
 
+    - Spec  (config/grid.yaml): user-owned strategy params. Engine reads, never writes,
+      so it can be edited live (``afctl edit``) without stopping the engine.
+    - Status (state/grid_state.json): engine-owned runtime — the evolved ``base_price``,
+      active orders and grid state. Engine reads + writes; users do not hand-edit it.
+
+    ``load()`` reconciles the two into the in-memory ``GridRuntimeConfig`` the rest of the
+    engine already uses (unchanged). ``save()`` persists only the runtime status.
+
+    ``base_price`` is dual-natured: the user seeds an anchor in the spec and the engine
+    evolves it after fills. We remember the last spec anchor in the status; if the spec
+    anchor changes, the user re-anchored manually and their value wins, otherwise the
+    engine's evolved value is kept.
+    """
+
+    def __init__(self, spec_path: Path, state_path: Path) -> None:
+        self.spec_path = spec_path
+        self.state_path = state_path
+        # Filled on load(), consumed on save() to translate the in-memory single
+        # ``paused`` flag back into "user pause" (spec) vs "engine halt" (status).
+        self._spec_base: dict[str, float] = {}
+        self._spec_paused: dict[str, bool] = {}
+
+    # --- load -----------------------------------------------------------------
     def load(self) -> GridRuntimeConfig:
-        if not self.path.exists():
-            raise ConfigError(f"grid config file not found: {self.path}")
-        raw = yaml.safe_load(self.path.read_text()) or {}
+        spec = self._load_spec()
+        symbols_state = self._load_state().get("symbols", {})
+
+        self._spec_base = {}
+        self._spec_paused = {}
+        grids = [self._reconcile(raw, symbols_state.get(raw["symbol"])) for raw in spec["grids"]]
+
+        return GridRuntimeConfig(
+            strategy_name=spec["strategy_name"],
+            audit_log_sample_rate=spec["audit_log_sample_rate"],
+            trading_window=spec["trading_window"],
+            grids=grids,
+        )
+
+    def _reconcile(self, spec_raw: dict[str, Any], st: dict[str, Any] | None) -> GridEntry:
+        symbol = spec_raw["symbol"]
+        spec_base = spec_raw["base_price"]
+        spec_paused = spec_raw["paused"]
+        self._spec_paused[symbol] = spec_paused
+
+        if st is None:
+            # First run for this symbol. Tolerate a legacy combined grid.yaml by seeding
+            # runtime from any state/active_order still present in the spec entry.
+            base_price = spec_base
+            grid_state = GridState(str(spec_raw.get("state") or GridState.WAITING_TRIGGER.value))
+            active = _active_order(spec_raw.get("active_order"))
+            halted = False
+            self._spec_base[symbol] = spec_base
+        else:
+            persisted_anchor = float(st.get("spec_base_price", spec_base))
+            # Re-anchor is detected purely by the spec anchor changing vs. the last-seen
+            # snapshot — the engine never diffs your edit, it just compares this one field.
+            # Compare at the same rounding both sides so a >4-decimal anchor cannot be
+            # mistaken for a constant re-anchor (which would stop evolution from sticking).
+            if _round_price(spec_base) != _round_price(persisted_anchor):
+                # You edited the spec anchor → manual re-anchor wins over engine evolution.
+                base_price = spec_base
+                self._spec_base[symbol] = spec_base
+            else:
+                # Anchor unchanged → keep the engine's evolved base_price; never clobber it.
+                base_price = float(st.get("base_price", spec_base))
+                self._spec_base[symbol] = persisted_anchor
+            grid_state = GridState(str(st.get("state", GridState.WAITING_TRIGGER.value)))
+            active = _active_order(st.get("active_order"))
+            halted = bool(st.get("halted", False))
+
+        return GridEntry(
+            symbol=symbol,
+            base_price=base_price,
+            up_pct=spec_raw["up_pct"],
+            down_pct=spec_raw["down_pct"],
+            trade_amount=spec_raw["trade_amount"],
+            state=grid_state,
+            paused=spec_paused or halted,
+            active_order=active,
+        )
+
+    # --- save -----------------------------------------------------------------
+    def save(self, config: GridRuntimeConfig) -> None:
+        self._atomic_write({
+            "version": STATE_VERSION,
+            "symbols": {grid.symbol: self._state_entry(grid) for grid in config.grids},
+        })
+
+    def _atomic_write(self, payload: dict[str, Any]) -> None:
+        """Durably replace the status file: backup -> temp -> atomic rename.
+
+        Shared by every writer of grid_state.json so a reader (the engine loop,
+        another afctl invocation) can never observe a half-written file.
+        """
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.state_path.exists():
+            shutil.copy2(self.state_path, self.state_path.with_suffix(self.state_path.suffix + ".bak"))
+        tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, indent=2))
+        tmp_path.replace(self.state_path)
+
+    def _state_entry(self, grid: GridEntry) -> dict[str, Any]:
+        spec_paused = self._spec_paused.get(grid.symbol, False)
+        spec_base = self._spec_base.get(grid.symbol, grid.base_price)
+        return {
+            "base_price": _round_price(grid.base_price),
+            "spec_base_price": _round_price(spec_base),
+            "state": grid.state.value,
+            # In-memory ``paused`` collapses user pause + engine halt. The user switch
+            # lives in the spec, so anything paused-but-not-user-paused is an engine halt.
+            "halted": bool(grid.paused and not spec_paused),
+            "active_order": _active_order_dict(grid.active_order),
+        }
+
+    # --- resume ---------------------------------------------------------------
+    def clear_halt(self, symbol: str | None = None) -> list[str]:
+        """Clear engine-set halts in the status file. Returns the symbols resumed.
+
+        NOTE: this writes the file from outside the engine's event loop. It is
+        reliable when the halted symbol is idle (no order events -> the engine
+        does not re-save and clobber the cleared flag before its next reload).
+        While other symbols are actively filling, the engine may re-affirm
+        ``halted`` on its next save and overwrite this. The robust fix is a
+        resume control-channel the engine consumes itself rather than poking the
+        file underneath it; until then, resume a busy grid when it is quiet or
+        restart the engine. See README "恢复被引擎暂停的标的".
+        """
+        state = self._load_state()
+        symbols = state.get("symbols", {})
+        target = symbol.upper().strip() if symbol else None
+        cleared: list[str] = []
+        for sym, st in symbols.items():
+            if target and sym != target:
+                continue
+            if st.get("halted"):
+                st["halted"] = False
+                cleared.append(sym)
+        if cleared:
+            self._atomic_write(state)
+        return cleared
+
+    # --- io -------------------------------------------------------------------
+    def _load_spec(self) -> dict[str, Any]:
+        if not self.spec_path.exists():
+            raise ConfigError(f"grid spec not found: {self.spec_path}")
+        raw = yaml.safe_load(self.spec_path.read_text()) or {}
         if not isinstance(raw, dict):
             raise ConfigError("grid.yaml must contain a mapping")
-
         window_raw = _mapping(raw, "trading_window")
         grids_raw = raw.get("grids", [])
         if not isinstance(grids_raw, list) or not grids_raw:
             raise ConfigError("grid.yaml grids must be a non-empty list")
-
-        return GridRuntimeConfig(
-            strategy_name=str(raw.get("strategy_name", "grid_v1")),
-            audit_log_sample_rate=float(raw.get("audit_log_sample_rate", 0.01)),
-            trading_window=TradingWindow(
+        return {
+            "strategy_name": str(raw.get("strategy_name", "grid_v1")),
+            "audit_log_sample_rate": float(raw.get("audit_log_sample_rate", 0.01)),
+            "trading_window": TradingWindow(
                 timezone=str(window_raw.get("timezone", "America/New_York")),
                 start=str(window_raw.get("start", "04:00")),
                 end=str(window_raw.get("end", "20:00")),
                 outside_rth=bool(window_raw.get("outside_rth", True)),
             ),
-            grids=[_grid_entry(item) for item in grids_raw],
-        )
+            "grids": [_spec_grid(item) for item in grids_raw],
+        }
 
-    def save(self, config: GridRuntimeConfig) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            shutil.copy2(self.path, self.path.with_suffix(self.path.suffix + ".bak"))
+    def _load_state(self) -> dict[str, Any]:
+        if not self.state_path.exists():
+            return {}
+        try:
+            data = json.loads(self.state_path.read_text())
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"grid state is corrupt: {self.state_path}: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ConfigError("grid_state.json must contain an object")
+        return data
 
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(yaml.safe_dump(_runtime_config_dict(config), sort_keys=False))
-        tmp_path.chmod(0o660)
-        tmp_path.replace(self.path)
 
-
-def _grid_entry(raw: Any) -> GridEntry:
+def _spec_grid(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ConfigError("each grid entry must be a mapping")
     symbol = str(raw.get("symbol", "")).upper().strip()
@@ -74,17 +216,17 @@ def _grid_entry(raw: Any) -> GridEntry:
         raise ConfigError(f"grid {symbol} up_pct/down_pct must be positive")
     if trade_amount <= 0:
         raise ConfigError(f"grid {symbol} trade_amount must be positive")
-    active_raw = raw.get("active_order")
-    return GridEntry(
-        symbol=symbol,
-        base_price=base_price,
-        up_pct=up_pct,
-        down_pct=down_pct,
-        trade_amount=trade_amount,
-        state=GridState(str(raw.get("state", GridState.WAITING_TRIGGER.value))),
-        paused=bool(raw.get("paused", False)),
-        active_order=_active_order(active_raw),
-    )
+    return {
+        "symbol": symbol,
+        "base_price": base_price,
+        "up_pct": up_pct,
+        "down_pct": down_pct,
+        "trade_amount": trade_amount,
+        "paused": bool(raw.get("paused", False)),
+        # Legacy passthrough: only consulted on first run when no status file exists yet.
+        "state": raw.get("state"),
+        "active_order": raw.get("active_order"),
+    }
 
 
 def _active_order(raw: Any) -> ActiveOrder | None:
@@ -114,28 +256,6 @@ def _active_order(raw: Any) -> ActiveOrder | None:
         execution_filled_quantity=float(raw.get("execution_filled_quantity", 0)),
         seen_exec_ids=[str(item) for item in raw.get("seen_exec_ids", [])],
     )
-
-
-def _runtime_config_dict(config: GridRuntimeConfig) -> dict[str, Any]:
-    return {
-        "strategy_name": config.strategy_name,
-        "audit_log_sample_rate": config.audit_log_sample_rate,
-        "trading_window": asdict(config.trading_window),
-        "grids": [_grid_entry_dict(grid) for grid in config.grids],
-    }
-
-
-def _grid_entry_dict(grid: GridEntry) -> dict[str, Any]:
-    return {
-        "symbol": grid.symbol,
-        "base_price": _round_price(grid.base_price),
-        "up_pct": grid.up_pct,
-        "down_pct": grid.down_pct,
-        "trade_amount": grid.trade_amount,
-        "state": grid.state.value,
-        "paused": grid.paused,
-        "active_order": _active_order_dict(grid.active_order),
-    }
 
 
 def _active_order_dict(order: ActiveOrder | None) -> dict[str, Any] | None:
