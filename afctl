@@ -12,21 +12,25 @@ KILL_SWITCH="$ROOT_DIR/state/kill-switch"
 
 usage() {
   cat <<'EOF'
-AlphaForge 管理命令：
-  sudo ./afctl up               构建并启动（gateway + engine）
+AlphaForge 管理命令（涉及 docker 的需 sudo；纯读文件的可免 sudo）：
+  sudo ./afctl up               构建并启动（gateway + engine + watchdog）
   sudo ./afctl stop             停止容器（保留，不删除）
   sudo ./afctl restart          重启容器
   sudo ./afctl down             停止并移除容器
-  ./afctl status                服务/容器/端口/网格 一屏看全
-  ./afctl logs [engine|gateway|watchdog|trade|audit]   查看日志（默认 engine）
-  ./afctl grid                  查看策略声明(spec) + 运行态(status)
+  sudo ./afctl logs [engine|gateway|watchdog]   容器日志（默认 engine）
+       ./afctl logs [trade|audit]               交易/审计日志（免 sudo）
+       ./afctl status           容器/端口/心跳/网格 一屏看全（容器状态需 sudo）
+       ./afctl grid             查看策略声明(spec) + 运行态(status)
   sudo ./afctl edit             改策略声明 grid.yaml（引擎热加载，无需停服务）
   sudo ./afctl resume [标的]    解除引擎对某标的的熔断（下单被拒后会自动暂停）
-  sudo ./afctl kill on|off|status             紧急停止/恢复下单
-  ./afctl doctor                引擎自检（配置/路径/IBKR 端口）
-  ./afctl alert-test            发送一条微信测试告警（验证渠道连通）
-  ./afctl test                  运行验收单测（paper 安全网）
+  sudo ./afctl kill on|off      紧急停止/恢复下单
+       ./afctl kill status      查看 kill switch 状态（免 sudo）
+  sudo ./afctl doctor           引擎自检（配置/路径/IBKR 端口）
+  sudo ./afctl alert-test       发送一条微信测试告警（验证渠道连通）
+  sudo ./afctl test             运行验收单测（paper 安全网）
   sudo ./afctl update           git pull → 重建 → 跑测试 → 重启
+
+提示：拿不准就加 sudo。docker 访问需 root，且 config/env 是 root 私有(600)。
 EOF
 }
 
@@ -38,15 +42,19 @@ require_env() {
   done
 }
 
-container_state() { docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null || echo missing; }
+container_state() { timeout 6 docker inspect -f '{{.State.Status}}' "$1" 2>/dev/null || echo missing; }
 
 cmd_status() {
-  compose ps 2>/dev/null || true
-  echo
   info "容器状态："
-  printf "  %-20s %s\n" "ib-gateway"          "$(container_state ib-gateway)"
-  printf "  %-20s %s\n" "alphaforge-engine"   "$(container_state alphaforge-engine)"
-  printf "  %-20s %s\n" "alphaforge-watchdog" "$(container_state alphaforge-watchdog)"
+  # docker info 既探权限也探 daemon；加超时，避免无权限/daemon 卡住时干等。
+  if timeout 8 docker info >/dev/null 2>&1; then
+    compose ps 2>/dev/null || true
+    printf "  %-20s %s\n" "ib-gateway"          "$(container_state ib-gateway)"
+    printf "  %-20s %s\n" "alphaforge-engine"   "$(container_state alphaforge-engine)"
+    printf "  %-20s %s\n" "alphaforge-watchdog" "$(container_state alphaforge-watchdog)"
+  else
+    echo "  ⚠ 无法访问 docker（无权限或 daemon 无响应）——读容器状态请加 sudo：sudo ./afctl status"
+  fi
   echo
   info "引擎心跳（state/heartbeat.json）："
   if [[ -f "$ROOT_DIR/state/heartbeat.json" ]]; then
@@ -89,9 +97,9 @@ PY
 
 cmd_logs() {
   case "${1:-engine}" in
-    engine)             compose logs -f --tail=100 engine ;;
-    gateway|ib-gateway) compose logs -f --tail=100 ib-gateway ;;
-    watchdog)           compose logs -f --tail=100 watchdog ;;
+    engine)             need_root ./afctl logs engine; compose logs -f --tail=100 engine ;;
+    gateway|ib-gateway) need_root ./afctl logs gateway; compose logs -f --tail=100 ib-gateway ;;
+    watchdog)           need_root ./afctl logs watchdog; compose logs -f --tail=100 watchdog ;;
     trade)              tail -f "$ROOT_DIR/logs/trade.jsonl" ;;
     audit)              tail -f "$ROOT_DIR/logs/audit.jsonl" ;;
     *) die "用法: ./afctl logs [engine|gateway|watchdog|trade|audit]" ;;
@@ -154,6 +162,7 @@ cmd_kill() {
 }
 
 cmd_test() {
+  need_root ./afctl test
   log "构建引擎镜像..."
   compose build engine
   log "运行验收单测..."
@@ -187,8 +196,8 @@ case "$cmd" in
   edit)       cmd_edit ;;
   resume)     cmd_resume "$@" ;;
   kill)       cmd_kill "$@" ;;
-  doctor)     compose run --rm --no-deps engine alphaforge doctor ;;
-  alert-test) compose run --rm --no-deps engine alphaforge alert-test ;;
+  doctor)     need_root ./afctl doctor; compose run --rm --no-deps engine alphaforge doctor ;;
+  alert-test) need_root ./afctl alert-test; compose run --rm --no-deps engine alphaforge alert-test ;;
   test)       cmd_test ;;
   update)     cmd_update ;;
   help|-h|--help) usage ;;

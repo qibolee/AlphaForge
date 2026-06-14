@@ -75,27 +75,31 @@ sudo ./start.sh
 ## 日常管理（afctl）
 
 ```bash
-sudo ./afctl up               构建并启动（gateway + engine）
+sudo ./afctl up               构建并启动（gateway + engine + watchdog）
 sudo ./afctl stop             停止容器（保留，不删除）
 sudo ./afctl restart          重启容器
 sudo ./afctl down             停止并移除容器
 
-./afctl status                服务/容器/端口/网格 一屏看全
-./afctl logs                  引擎运行日志（默认）
-./afctl logs trade            交易事件日志（连接/触发/成交/撤单/风控）
-./afctl logs gateway          IB Gateway 登录/会话日志
-./afctl logs audit            采样后的常规事件（行情/未触发等）
-./afctl grid                  查看策略声明(spec) + 运行态(status)
+     ./afctl status           容器/端口/心跳/网格 一屏看全（容器状态那部分需 sudo）
+sudo ./afctl logs             引擎运行日志（默认 engine）
+sudo ./afctl logs gateway     IB Gateway 登录/会话日志
+sudo ./afctl logs watchdog    看门狗日志
+     ./afctl logs trade       交易事件日志（连接/触发/成交/撤单/风控，免 sudo）
+     ./afctl logs audit       采样后的常规事件（行情/未触发等，免 sudo）
+     ./afctl grid             查看策略声明(spec) + 运行态(status)
 
 sudo ./afctl edit             改策略声明 grid.yaml（引擎热加载，无需停服务）
 sudo ./afctl resume [标的]    解除引擎对某标的的熔断（下单被拒后自动暂停）
 sudo ./afctl kill on|off      紧急停止/恢复下单（撤单与状态仍正常）
-./afctl kill status           查看 kill switch 状态
+     ./afctl kill status      查看 kill switch 状态
 
-./afctl doctor                引擎自检（配置/路径/IBKR 端口）
-./afctl test                  运行验收单测（paper 安全网）
+sudo ./afctl doctor           引擎自检（配置/路径/IBKR 端口）
+sudo ./afctl alert-test       发送一条微信测试告警（验证渠道连通）
+sudo ./afctl test             运行验收单测（paper 安全网）
 sudo ./afctl update           git pull → 重建 → 跑测试 → 重启
 ```
+
+> **关于 sudo**：凡是要访问 docker 的命令都需 root——① docker 守护进程默认只允许 root；② `config/env` 是 root 私有(`600`)，compose 读不到。纯读文件的命令（`status` 的心跳/端口/网格部分、`grid`、`logs trade|audit`、`kill status`）可免 sudo。**拿不准就加 sudo**；不加时这些命令会明确提示"请用 root 运行"，不再抛费解的 `permission denied`。
 
 ---
 

@@ -10,6 +10,10 @@ services:
       - TWS_PASSWORD=${IB_PASSWORD}
       - TRADING_MODE=${IB_MODE}
       - AUTO_RESTART_TIME=${AUTO_RESTART_TIME}
+      # 遇到"已存在会话"对话框时自动抢占（结束旧会话、本网关继续），
+      # 避免重启后的僵尸会话把登录卡死。代价：会踢掉你用同账户的手机/TWS 登录，
+      # 所以无人值守的量化登录建议用专用账户。
+      - EXISTING_SESSION_DETECTED_ACTION=primary
     ports:
       # Docker 格式：host_ip:host_port:container_port
       # paper: Python 连 host 4002（镜像 paper relay 是 container 4004）
