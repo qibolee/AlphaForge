@@ -35,7 +35,7 @@ done
 # 4) 首次从模板创建 grid.yaml（之后由引擎读写，不再覆盖）
 if [[ ! -f "$HERE/config/grid.yaml" ]]; then
   cp "$HERE/config/grid.example.yaml" "$HERE/config/grid.yaml"
-  log "已从模板创建 config/grid.yaml（用 ./afctl edit 修改参数）。"
+  log "已从模板创建 config/grid.yaml（用 sudo ./afctl edit 修改参数）。"
 fi
 
 # 5) 构建并启动
@@ -61,16 +61,17 @@ done
 log "部署完成！"
 cat <<'EOF'
 
-──────────────── 日常命令 ────────────────
-  ./afctl status              服务/容器/端口/网格 一屏看全
-  ./afctl logs trade          交易事件日志（连接/触发/成交/撤单/风控）
-  ./afctl logs engine         引擎运行日志（异常堆栈）
-  ./afctl logs gateway        IB Gateway 登录/会话日志
-  ./afctl grid                查看网格参数与状态
-  sudo ./afctl edit           安全修改 grid.yaml（自动 停→备份→改→启）
+─────────── 日常命令（都用 sudo）───────────
+  sudo ./afctl status         服务/容器/端口/心跳/网格 一屏看全
+  sudo ./afctl logs trade     交易事件日志（连接/触发/成交/撤单/风控）
+  sudo ./afctl logs engine    引擎运行日志（异常堆栈）
+  sudo ./afctl logs gateway   IB Gateway 登录/会话日志
+  sudo ./afctl grid           查看网格参数与状态
+  sudo ./afctl edit           改 grid.yaml（备份→编辑→校验，引擎热加载无需停服务）
   sudo ./afctl kill on|off    紧急停止/恢复下单
   sudo ./afctl update         更新代码 + 验收测试 + 重启
 ────────────────────────────────────────
+  • 所有 afctl 命令都需 sudo（docker 与 config/env 都要 root）。
   • 确认 AWS 安全组按需放行；IB Gateway 用 config/env 的账号自动登录。
-  • 若交易连不上，先看 ./afctl logs gateway 确认已登录成功。
+  • 若交易连不上，先看 sudo ./afctl logs gateway 确认已登录成功。
 EOF

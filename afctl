@@ -12,25 +12,23 @@ KILL_SWITCH="$ROOT_DIR/state/kill-switch"
 
 usage() {
   cat <<'EOF'
-AlphaForge 管理命令（涉及 docker 的需 sudo；纯读文件的可免 sudo）：
+AlphaForge 管理命令（除 help 外都需 sudo）：
   sudo ./afctl up               构建并启动（gateway + engine + watchdog）
   sudo ./afctl stop             停止容器（保留，不删除）
   sudo ./afctl restart          重启容器
   sudo ./afctl down             停止并移除容器
-  sudo ./afctl logs [engine|gateway|watchdog]   容器日志（默认 engine）
-       ./afctl logs [trade|audit]               交易/审计日志（免 sudo）
-       ./afctl status           容器/端口/心跳/网格 一屏看全（容器状态需 sudo）
-       ./afctl grid             查看策略声明(spec) + 运行态(status)
+  sudo ./afctl status           容器/端口/心跳/网格 一屏看全
+  sudo ./afctl logs [engine|gateway|watchdog|trade|audit]   查看日志（默认 engine）
+  sudo ./afctl grid             查看策略声明(spec) + 运行态(status)
   sudo ./afctl edit             改策略声明 grid.yaml（引擎热加载，无需停服务）
   sudo ./afctl resume [标的]    解除引擎对某标的的熔断（下单被拒后会自动暂停）
-  sudo ./afctl kill on|off      紧急停止/恢复下单
-       ./afctl kill status      查看 kill switch 状态（免 sudo）
+  sudo ./afctl kill on|off|status   紧急停止/恢复下单 / 查看状态
   sudo ./afctl doctor           引擎自检（配置/路径/IBKR 端口）
   sudo ./afctl alert-test       发送一条微信测试告警（验证渠道连通）
   sudo ./afctl test             运行验收单测（paper 安全网）
   sudo ./afctl update           git pull → 重建 → 跑测试 → 重启
 
-提示：拿不准就加 sudo。docker 访问需 root，且 config/env 是 root 私有(600)。
+说明：所有命令都需 root（docker 与 config/env(600) 都要 root）。忘加 sudo 会清楚提示"请用 root 运行"。
 EOF
 }
 
@@ -53,7 +51,7 @@ cmd_status() {
     printf "  %-20s %s\n" "alphaforge-engine"   "$(container_state alphaforge-engine)"
     printf "  %-20s %s\n" "alphaforge-watchdog" "$(container_state alphaforge-watchdog)"
   else
-    echo "  ⚠ 无法访问 docker（无权限或 daemon 无响应）——读容器状态请加 sudo：sudo ./afctl status"
+    echo "  ⚠ 无法访问 docker daemon（未运行或无响应）——试试 sudo systemctl restart docker"
   fi
   echo
   info "引擎心跳（state/heartbeat.json）："
@@ -97,9 +95,9 @@ PY
 
 cmd_logs() {
   case "${1:-engine}" in
-    engine)             need_root ./afctl logs engine; compose logs -f --tail=100 engine ;;
-    gateway|ib-gateway) need_root ./afctl logs gateway; compose logs -f --tail=100 ib-gateway ;;
-    watchdog)           need_root ./afctl logs watchdog; compose logs -f --tail=100 watchdog ;;
+    engine)             compose logs -f --tail=100 engine ;;
+    gateway|ib-gateway) compose logs -f --tail=100 ib-gateway ;;
+    watchdog)           compose logs -f --tail=100 watchdog ;;
     trade)              tail -f "$ROOT_DIR/logs/trade.jsonl" ;;
     audit)              tail -f "$ROOT_DIR/logs/audit.jsonl" ;;
     *) die "用法: ./afctl logs [engine|gateway|watchdog|trade|audit]" ;;
@@ -125,7 +123,6 @@ cmd_grid() {
 
 # 引擎从不写 grid.yaml，所以可热改：编辑后引擎下一轮自动加载，无需停服务。
 cmd_edit() {
-  need_root ./afctl edit
   local f="$ROOT_DIR/config/grid.yaml"
   [[ -f "$f" ]] || die "找不到 $f，请先 sudo ./start.sh"
   mkdir -p "$ROOT_DIR/state"
@@ -143,7 +140,6 @@ cmd_edit() {
 }
 
 cmd_resume() {
-  need_root ./afctl resume
   if [[ -n "${1:-}" ]]; then
     compose run --rm --no-deps engine alphaforge resume --symbol "$1"
   else
@@ -153,16 +149,15 @@ cmd_resume() {
 
 cmd_kill() {
   case "${1:-status}" in
-    on)  need_root ./afctl kill on; mkdir -p "$ROOT_DIR/state"; echo manual > "$KILL_SWITCH"
+    on)  mkdir -p "$ROOT_DIR/state"; echo manual > "$KILL_SWITCH"
          warn "kill switch ON：引擎不会再下单（约 1 秒内生效）。" ;;
-    off) need_root ./afctl kill off; rm -f "$KILL_SWITCH"; log "kill switch OFF。" ;;
+    off) rm -f "$KILL_SWITCH"; log "kill switch OFF。" ;;
     status) [[ -f "$KILL_SWITCH" ]] && echo "kill_switch=on ($KILL_SWITCH)" || echo "kill_switch=off" ;;
     *) die "用法: ./afctl kill [on|off|status]" ;;
   esac
 }
 
 cmd_test() {
-  need_root ./afctl test
   log "构建引擎镜像..."
   compose build engine
   log "运行验收单测..."
@@ -170,7 +165,6 @@ cmd_test() {
 }
 
 cmd_update() {
-  need_root ./afctl update
   log "拉取最新代码..."
   git -C "$ROOT_DIR" pull --ff-only
   log "重建引擎镜像..."
@@ -185,19 +179,27 @@ cmd_update() {
 }
 
 cmd="${1:-help}"; shift || true
+
+# 统一权限闸：除 help 外所有命令都要 root。docker 守护进程与 config/env(600) 都需 root，
+# 在入口一处拦截，杜绝"某命令忘加 sudo 时半失败/卡住/谎报"这类问题。
 case "$cmd" in
-  up|start)   need_root ./afctl up; require_env; mkdir -p "$ROOT_DIR/state" "$ROOT_DIR/logs"; compose up -d --build ;;
-  stop)       need_root ./afctl stop; compose stop ;;
-  restart)    need_root ./afctl restart; compose restart ;;
-  down)       need_root ./afctl down; compose down ;;
+  help|-h|--help|"") ;;
+  *) need_root "./afctl $cmd" ;;
+esac
+
+case "$cmd" in
+  up|start)   require_env; mkdir -p "$ROOT_DIR/state" "$ROOT_DIR/logs"; compose up -d --build ;;
+  stop)       compose stop ;;
+  restart)    compose restart ;;
+  down)       compose down ;;
   status)     cmd_status ;;
   logs)       cmd_logs "$@" ;;
   grid)       cmd_grid ;;
   edit)       cmd_edit ;;
   resume)     cmd_resume "$@" ;;
   kill)       cmd_kill "$@" ;;
-  doctor)     need_root ./afctl doctor; compose run --rm --no-deps engine alphaforge doctor ;;
-  alert-test) need_root ./afctl alert-test; compose run --rm --no-deps engine alphaforge alert-test ;;
+  doctor)     compose run --rm --no-deps engine alphaforge doctor ;;
+  alert-test) compose run --rm --no-deps engine alphaforge alert-test ;;
   test)       cmd_test ;;
   update)     cmd_update ;;
   help|-h|--help) usage ;;
