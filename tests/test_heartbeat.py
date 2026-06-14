@@ -35,6 +35,11 @@ class HeartbeatTest(unittest.TestCase):
         snap = LivenessState().snapshot()
         self.assertIsNone(snap["last_quote_age_seconds"])
         self.assertIsNone(snap["last_quote_at"])
+        self.assertEqual(snap["last_error"], "")
+
+    def test_snapshot_includes_last_error(self) -> None:
+        snap = LivenessState(last_error="TimeoutError: API connection failed").snapshot()
+        self.assertEqual(snap["last_error"], "TimeoutError: API connection failed")
 
     def test_write_then_age_is_fresh(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -23,7 +23,7 @@ AlphaForge 管理命令（除 help 外都需 sudo）：
   sudo ./afctl edit             改策略声明 grid.yaml（引擎热加载，无需停服务）
   sudo ./afctl resume [标的]    解除引擎对某标的的熔断（下单被拒后会自动暂停）
   sudo ./afctl kill on|off|status   紧急停止/恢复下单 / 查看状态
-  sudo ./afctl doctor           引擎自检（配置/路径/IBKR 端口）
+  sudo ./afctl doctor           全面体检（容器/网关登录/端口/心跳/风控/配置）
   sudo ./afctl alert-test       发送一条微信测试告警（验证渠道连通）
   sudo ./afctl test             运行验收单测（paper 安全网）
   sudo ./afctl update           git pull → 重建 → 跑测试 → 重启
@@ -66,6 +66,9 @@ lq = d.get("last_quote_age_seconds")
 lq_s = f"{lq:.0f}s 前" if isinstance(lq, (int, float)) else "—"
 print(f"  {mark}  距上次心跳 {age:.0f}s  阶段={d.get('session_phase')}  "
       f"已连接={d.get('connected')}  距上次行情={lq_s}")
+le = d.get("last_error") or ""
+if le and not d.get("connected"):
+    print(f"  最近错误：{le}")
 PY
   else
     echo "  (引擎尚未写心跳；启动后约 15s 生成)"
@@ -91,6 +94,63 @@ for s, v in json.load(open(sys.argv[1])).get("symbols", {}).items():
 PY
   fi
   [[ -f "$KILL_SWITCH" ]] && { echo; warn "KILL SWITCH 已启用：引擎不会下单（撤单/状态仍正常）。"; }
+}
+
+cmd_doctor() {
+  info "1) 容器状态"
+  for c in ib-gateway alphaforge-engine alphaforge-watchdog; do
+    printf "   %-22s %s\n" "$c" "$(container_state "$c")"
+  done
+
+  info "2) IB Gateway 登录（解析最近日志）"
+  local glog; glog="$(timeout 8 docker logs ib-gateway --tail 300 2>/dev/null || true)"
+  if [[ -z "$glog" ]]; then
+    echo "   ? 取不到 gateway 日志（容器未起？）"
+  else
+    local nlogin nexist
+    nlogin="$(grep -n 'Login has completed' <<<"$glog" | tail -1 | cut -d: -f1)"
+    nexist="$(grep -n 'Existing session detected' <<<"$glog" | tail -1 | cut -d: -f1)"
+    if [[ -n "$nexist" && ( -z "$nlogin" || "$nexist" -gt "$nlogin" ) ]]; then
+      echo "   ✗ 检测到「已存在会话」冲突——别处(另一台机/手机/TWS)在用同一账户。"
+      echo "     停掉它，或 sudo ./afctl restart 让本机抢占。"
+    elif [[ -n "$nlogin" ]]; then
+      echo "   ✓ 已登录成功（Login has completed）"
+    else
+      echo "   … 尚未登录完成（可能仍在连接/登录中，稍候再看）"
+    fi
+  fi
+
+  info "3) IBKR 端口监听 (4001/4002)"
+  ss -tlnp 2>/dev/null | grep -E ':400[12]\b' | sed 's/^/   /' \
+    || echo "   ✗ 4001/4002 未监听（gateway 未就绪）"
+
+  info "4) 引擎心跳 / 连接"
+  if [[ -f "$ROOT_DIR/state/heartbeat.json" ]]; then
+    python3 - "$ROOT_DIR/state/heartbeat.json" <<'PY' 2>/dev/null || echo "   ? 心跳无法解析"
+import json, sys
+from datetime import datetime, timezone
+d = json.load(open(sys.argv[1]))
+age = (datetime.now(timezone.utc) - datetime.fromisoformat(d["ts"])).total_seconds()
+print(f"   心跳 {age:.0f}s 前  阶段={d.get('session_phase')}  已连接={d.get('connected')}")
+le = d.get("last_error") or ""
+if le and not d.get("connected"):
+    print(f"   最近错误：{le}")
+PY
+  else
+    echo "   … 引擎尚未写心跳"
+  fi
+
+  info "5) 近期风控拒单（静默不成交探测）"
+  local rr; rr="$(tail -n 500 "$ROOT_DIR/logs/audit.jsonl" 2>/dev/null | grep -c 'risk_rejected' || true)"
+  if [[ "${rr:-0}" -gt 0 ]]; then
+    echo "   ⚠ 最近有 $rr 条 risk_rejected——若持续，可能触发价已到却被风控拒单"
+    echo "     （常见：bid/ask 缺失致 spread 不可用）。检查行情订阅是否含 bid/ask。"
+  else
+    echo "   ✓ 无 risk_rejected"
+  fi
+
+  info "6) 引擎内配置自检"
+  compose run --rm --no-deps engine alphaforge doctor
 }
 
 cmd_logs() {
@@ -198,7 +258,7 @@ case "$cmd" in
   edit)       cmd_edit ;;
   resume)     cmd_resume "$@" ;;
   kill)       cmd_kill "$@" ;;
-  doctor)     compose run --rm --no-deps engine alphaforge doctor ;;
+  doctor)     cmd_doctor ;;
   alert-test) compose run --rm --no-deps engine alphaforge alert-test ;;
   test)       cmd_test ;;
   update)     cmd_update ;;

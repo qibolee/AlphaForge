@@ -61,6 +61,7 @@ class TradingEngine:
         self.liveness.connected = True
         self.liveness.symbols = grid_config.symbols
         self.liveness.session_phase = "running"
+        self.liveness.last_error = ""  # cleared on a successful connect
         logger.trade(
             "connected",
             "_system",
@@ -183,6 +184,7 @@ async def run_forever() -> None:
                 raise
             except Exception as exc:
                 liveness.connected = False
+                liveness.last_error = f"{type(exc).__name__}: {exc}"[:300]
                 if not _is_recoverable_session_error(exc):
                     liveness.session_phase = "failed"
                     logger.trade(

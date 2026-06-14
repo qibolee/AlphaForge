@@ -85,7 +85,7 @@ sudo ./afctl grid             查看策略声明(spec) + 运行态(status)
 sudo ./afctl edit             改策略声明 grid.yaml（引擎热加载，无需停服务）
 sudo ./afctl resume [标的]    解除引擎对某标的的熔断（下单被拒后自动暂停）
 sudo ./afctl kill on|off|status   紧急停止/恢复下单 / 查看状态
-sudo ./afctl doctor           引擎自检（配置/路径/IBKR 端口）
+sudo ./afctl doctor           全面体检（容器/网关登录/端口/心跳/风控/配置，排障首选）
 sudo ./afctl alert-test       发送一条微信测试告警（验证渠道连通）
 sudo ./afctl test             运行验收单测（paper 安全网）
 sudo ./afctl update           git pull → 重建 → 跑测试 → 重启

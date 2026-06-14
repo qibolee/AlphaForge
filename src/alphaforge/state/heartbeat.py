@@ -25,6 +25,7 @@ class LivenessState:
     retry_attempt: int = 0
     symbols: list[str] = field(default_factory=list)
     last_quote_at: datetime | None = None
+    last_error: str = ""  # most recent session failure reason (cleared on connect)
 
     def snapshot(self, now: datetime | None = None) -> dict[str, object]:
         now = now or datetime.now(timezone.utc)
@@ -42,6 +43,7 @@ class LivenessState:
             "symbols": list(self.symbols),
             "last_quote_at": self.last_quote_at.isoformat() if self.last_quote_at else None,
             "last_quote_age_seconds": last_quote_age,
+            "last_error": self.last_error,
         }
 
 
